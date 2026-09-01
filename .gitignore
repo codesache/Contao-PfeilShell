@@ -9,8 +9,9 @@ composer.lock
 *.swp
 *~
 
-# contao.sh-eigene Laufzeit-/Maschinen-Artefakte (host-spezifisch, nicht
-# fürs Repo gedacht)
+# contao.sh-eigene Laufzeit-/Maschinen-Artefakte (host-/projektspezifisch,
+# nicht fürs Repo gedacht)
+.contao.conf
 .contao-sh-php.conf
 *.log
 .pfeilshell-install.*

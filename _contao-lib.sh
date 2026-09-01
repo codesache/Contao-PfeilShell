@@ -294,13 +294,12 @@ contao_resolve_php() {
         return 0
     fi
 
-    if [ -n "${PHP_OVERRIDE_FILE:-}" ] && [ -f "$PHP_OVERRIDE_FILE" ]; then
-        local saved
-        saved="$(head -n1 "$PHP_OVERRIDE_FILE" 2>/dev/null)"
-        if [ -n "$saved" ] && [ -x "$saved" ]; then
-            PHP_BIN="$saved"
-            return 0
-        fi
+    # PHP_BIN_SELECTED kommt - falls vorhanden - direkt aus .contao.conf,
+    # das contao.sh bereits per 'source' eingebunden hat, bevor diese
+    # Funktion aufgerufen wird (siehe CONTAO_CONF_FILE-Handling in contao.sh).
+    if [ -n "${PHP_BIN_SELECTED:-}" ] && [ -x "$PHP_BIN_SELECTED" ]; then
+        PHP_BIN="$PHP_BIN_SELECTED"
+        return 0
     fi
 
     contao_collect_php_candidates || return 1
@@ -1213,6 +1212,24 @@ contao_env_set_value() {
         echo "$line" >> "$tmp"
     fi
 
+    mv "$tmp" "$file"
+}
+
+# Entfernt die Zeile "KEY=..." komplett aus FILE (z.B. um eine gespeicherte
+# Override-Einstellung wieder auf "automatisch/Standard" zurückzusetzen,
+# ohne dabei andere Einstellungen in derselben Datei zu verlieren). Kein
+# Fehler, falls FILE oder KEY nicht existiert.
+contao_env_unset_value() {
+    local key="$1" file="$2"
+    [ -f "$file" ] || return 0
+    local tmp l
+    tmp="$(mktemp "${TMPDIR:-/tmp}/contao-sh-env.XXXXXX")"
+    while IFS= read -r l || [ -n "$l" ]; do
+        case "$l" in
+            "${key}="*) ;;
+            *) echo "$l" >> "$tmp" ;;
+        esac
+    done < "$file"
     mv "$tmp" "$file"
 }
 

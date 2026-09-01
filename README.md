@@ -31,11 +31,14 @@ Contao PfeilShell ist in Abschnitte gruppiert:
 - **Composer** - `show`, `show -l`, `-V`, `selfupdate`, `update`
   (`--profile` / `--dry-run` / normal).
 - **Erweiterungen** - Checkbox-Auswahl aus einer konfigurierbaren Paketliste
-  (`composer require`, mit Dry-Run-Option und Bestätigung), Suche nach
-  Stichwort mit gefilterter Checkbox-Liste, sowie Entfernen aktuell
-  installierter Erweiterungen aus dieser Liste (`composer remove`).
+  (`EXTENSIONS_LIST`, lebt ausschließlich in `.contao.conf` - siehe unten;
+  `composer require`, mit Dry-Run-Option und Bestätigung), Live-Suche nach
+  Stichwort direkt auf **Packagist** (`composer search`, nicht die lokale
+  Liste) mit Checkbox-Auswahl der Treffer, sowie Entfernen aktuell
+  installierter Erweiterungen aus der lokalen Liste (`composer remove`).
 - **Werkzeuge** - Filesync (`contao:filesync`), Suchindex-Aufbau
-  (`contao:crawl`), Test-Mail-Versand (`mailer:send`).
+  (`contao:crawl`), Test-Mail-Versand (`mailer:send`, Absender/Empfänger
+  projektspezifisch merkbar - siehe `.contao.conf` unten).
 - **Konfiguration** - `.env.local` anlegen/bearbeiten: `DATABASE_URL` und
   `MAILER_DSN`, mit Erkennung/Vorbefüllung bestehender Werte, maskierter
   Passwort-Anzeige und automatischem Backup vor jedem Schreibvorgang.
@@ -110,12 +113,34 @@ Version erhalten - so einen Fall bitte anschließend manuell abgleichen.
   Vorrang vor der automatischen Suche).
 - **PHP-Version im Menü wählen (System → "PHP-Version wählen"):** listet alle
   gefundenen PHP-Binaries mit ihrer Version auf, alternativ lässt sich ein
-  Pfad manuell eingeben. Die Auswahl wird in `.contao-sh-php.conf` im
-  Script-Ordner gespeichert und bei jedem künftigen Aufruf automatisch
-  wieder verwendet - Composer und `contao-console` laufen sofort mit der
-  gewählten Version. Über denselben Menüpunkt lässt sich die Auswahl auch
-  wieder auf die automatische Erkennung zurücksetzen. `PHP_BIN_OVERRIDE`
-  im Konfig-Block hat weiterhin Vorrang vor dieser Menü-Auswahl.
+  Pfad manuell eingeben. Die Auswahl wird in `.contao.conf` (siehe unten)
+  gespeichert und bei jedem künftigen Aufruf automatisch wieder verwendet -
+  Composer und `contao-console` laufen sofort mit der gewählten Version.
+  Über denselben Menüpunkt lässt sich die Auswahl auch wieder auf die
+  automatische Erkennung zurücksetzen. `PHP_BIN_OVERRIDE` im Konfig-Block
+  hat weiterhin Vorrang vor dieser Menü-Auswahl.
+- **Projektspezifische Konfiguration (`.contao.conf`):** contao.sh selbst
+  ist für alle Projekte identisch - keine Paket-, Adress- oder sonstigen
+  Vorlieben fest im Code. Nur diese eine, im Projekt-Root liegende Datei
+  unterscheidet sich pro Projekt. Sie wird von contao.sh per `source`
+  eingebunden (echtes Bash, kein reines Zeilenformat) und überschreibt bei
+  Bedarf die Standard-Werte aus dem Konfig-Block. Existiert sie noch nicht,
+  legt contao.sh sie beim allerersten Aufruf automatisch an - vorbefüllt mit
+  den Test-Mail-Defaults (`TESTMAIL_FROM`/`TESTMAIL_TO`) sowie einer
+  Standard-`EXTENSIONS_LIST` (frei anpassbar: Zeilen ergänzen, ändern,
+  löschen), damit sofort eine sichtbare, direkt editierbare Datei vorliegt
+  statt erst nach der ersten Menü-Interaktion. `contao.sh` selbst enthält
+  dagegen kein einziges Paket fest im Code - `EXTENSIONS_LIST` ist dort nur
+  ein leeres Array, das ausschließlich als Fallback dient, falls
+  `.contao.conf` fehlt oder geleert wurde. `PHP_BIN_SELECTED` wird beim
+  Erstaufruf nur eingetragen, wenn tatsächlich ein passendes PHP-Binary
+  gefunden wurde - sonst bleibt die Zeile weg und jeder weitere Aufruf
+  versucht die automatische Erkennung erneut, bis PHP gefunden oder manuell
+  über "PHP-Version wählen" festgelegt wird. Nach Eingabe abweichender
+  Test-Mail-Adressen fragt contao.sh zusätzlich, ob sie als neuer Standard
+  für dieses Projekt gespeichert werden sollen. Ältere Installationen mit
+  der bis V1.0 genutzten separaten `.contao-sh-php.conf` werden beim ersten
+  Aufruf automatisch und unbemerkt nach `.contao.conf` migriert.
 - Composer wird im Projekt-Root zuerst über `composer.phar` gesucht, dann
   über ein globales `composer` im PATH, zuletzt per Auto-Download (siehe
   oben) - gilt sowohl für das reguläre Hauptmenü als auch für die
@@ -182,8 +207,8 @@ Version erhalten - so einen Fall bitte anschließend manuell abgleichen.
 geprüft und in einer simulierten Projektstruktur (Stub-`composer.phar`/
 `composer.phar`-Datei, Stub-`contao-console`, Stub-`composer`, Stub-`wget`)
 end-to-end durchgespielt: Hauptmenü inkl. Gruppierung, Checkbox-Installer
-inkl. Dry-Run, Erweiterungssuche mit Treffer-Filterung und
-Pfeiltasten-Checkbox-Auswahl, Erweiterungen entfernen (nur tatsächlich
+inkl. Dry-Run, Erweiterungssuche gegen Packagist (`composer search`) mit
+Pfeiltasten-Checkbox-Auswahl der Treffer, Erweiterungen entfernen (nur tatsächlich
 installierte Pakete), Cache leeren für prod + dev, `.env.local`-
 Konfiguration, Backup-Erstellung/-Liste/-Restore inkl. Sicherheitsabfragen,
 Migrate-Debugging, Test-Mail-Eingabe, composer.phar-Auto-Download bei
@@ -193,8 +218,10 @@ globales `composer`).
 
 ## Nicht enthalten / bewusst offen gelassen
 
-- Die Erweiterungsliste in `contao.sh` (`EXTENSIONS_LIST`) ist ein
-  Konfig-Array ganz oben im Script - Pakete ergänzen/entfernen einfach dort.
+- Die Erweiterungsliste (`EXTENSIONS_LIST`) lebt ausschließlich in
+  `.contao.conf` im Projekt-Root (dort ein echtes Bash-Array) - Pakete
+  ergänzen/ändern/entfernen einfach dort, `contao.sh` selbst bleibt für alle
+  Projekte identisch.
 - Migrationsbezogene DB-Änderungen laufen ausschließlich über
   `contao-console`/`contao:migrate`, keine direkten SQL-Befehle.
 - Cache leeren und Migrationen laufen ausschließlich über die in diesem

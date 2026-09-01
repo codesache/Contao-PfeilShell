@@ -11,6 +11,8 @@
 # Aufruf:  bash contao.sh   (oder ausführbar machen: chmod +x contao.sh)
 # Wird contao.sh in einen leeren Ordner gelegt und dort aufgerufen, bietet
 # es eine Grundinstallation (Contao 5.3.x / 5.7.x) an.
+#
+# Ein Projekt von CodeSache - https://www.codesache.de
 # ---------------------------------------------------------------------------
 
 # ===================== KONFIGURATION (projektspezifisch) ===================
@@ -39,31 +41,34 @@ REQUIRED_PHP="8.4"
 # getroffenen Auswahl.
 PHP_BIN_OVERRIDE=""
 
-# Datei (relativ zum Script-Ordner), in der eine im Menü getroffene
-# PHP-Versionsauswahl gespeichert wird - bleibt bei künftigen Aufrufen
-# erhalten, bis sie im Menü wieder zurückgesetzt wird. Wird PHP_BIN_OVERRIDE
-# oben gesetzt, hat das Vorrang vor dieser Datei.
-PHP_OVERRIDE_FILE_REL=".contao-sh-php.conf"
+# Datei (relativ zum Script-Ordner), in der projektspezifische Einstellungen
+# stehen - wird per 'source' eingebunden (echtes Bash, kein reines
+# Zeilenformat) und überschreibt bei Bedarf die Standard-Werte aus diesem
+# Konfig-Block. Existiert sie noch nicht, legt contao.sh sie beim ersten
+# Aufruf automatisch an (mit PHP_BIN_SELECTED, TESTMAIL_FROM/TESTMAIL_TO,
+# vorbefüllt aus den Defaults unten). contao.sh selbst bleibt dadurch für
+# alle Projekte identisch; nur diese eine Datei unterscheidet sich pro
+# Projekt - dort lässt sich bei Bedarf auch EXTENSIONS_LIST komplett
+# überschreiben. Wird PHP_BIN_OVERRIDE oben gesetzt, hat das immer Vorrang
+# vor der in dieser Datei gespeicherten PHP-Wahl.
+CONTAO_CONF_FILE_REL=".contao.conf"
 
-# Erweiterungen für die Checkbox-Auswahl.
-# Format je Zeile: "Composer-Paket|Kurzbeschreibung"
-EXTENSIONS_LIST=(
-    "madeyourday/contao-rocksolid-custom-elements|RockSolid Custom Elements - Basis für eigene Content-Elemente"
-    "madeyourday/contao-rocksolid-frontend-helper|RockSolid Frontend-Helper - Debug-/Diagnose-Hilfen im Frontend"
-    "terminal42/contao-leads|Contao Leads - Formular-/Lead-Erfassung"
-    "terminal42/notification_center|Notification Center - zentrales Benachrichtigungs-/Mailsystem"
-    "terminal42/contao-changelanguage|Changelanguage - Sprachumschalter mehrsprachiger Seiten"
-    "terminal42/contao-url-rewrite|URL Rewrite - Weiterleitungen/Rewrites verwalten"
-    "terminal42/contao-fineuploader|Fine Uploader - Datei-Upload-Widget im Frontend"
-    "codesache/contao-backend-user-style-bundle|Backend User Style Bundle - individuelles Backend-Farbschema"
-    "erdmannfreunde/contao-grid-bundle|Grid Bundle - Grid-System für Layout-Sections"
-    "erdmannfreunde/theme-toolbox|Theme Toolbox - Helferlein-Bundle fürs Theme"
-    "codefog/contao-news_categories|News Categories - Kategorien für die News-Erweiterung"
-)
+# Erweiterungen für die Checkbox-Auswahl - bewusst KEIN fester Inhalt hier
+# in contao.sh (contao.sh bleibt dadurch für alle Projekte identisch, ohne
+# eigene Paket-/Firmenvorlieben fest im Code). Die eigentliche Liste steht
+# ausschließlich in .contao.conf (siehe unten) und wird von dort per
+# 'source' geladen - beim allerersten Aufruf legt contao.sh sie dort direkt
+# vorbefüllt an. Bleibt EXTENSIONS_LIST leer (z.B. weil .contao.conf
+# gelöscht/geleert wurde), zeigen die Erweiterungen-Menüpunkte einen
+# entsprechenden Hinweis statt eines Fehlers.
+EXTENSIONS_LIST=()
 
-# Default-Absender/-Empfänger für den Test-Mail-Versand (im Dialog änderbar)
-TESTMAIL_FROM_DEFAULT="test@codesache.de"
-TESTMAIL_TO_DEFAULT="anmich@codesache.de"
+# Default-Absender/-Empfänger für den Test-Mail-Versand, falls .contao.conf
+# noch keine eigenen TESTMAIL_FROM/TESTMAIL_TO enthält (im Dialog änderbar,
+# projektspezifisch in .contao.conf speicherbar - siehe CONTAO_CONF_FILE_REL
+# oben).
+TESTMAIL_FROM_DEFAULT="test@MEINEDOMAIN.de"
+TESTMAIL_TO_DEFAULT="anmich@MEINEDOMAIN.de"
 
 # Dateiname der Umgebungs-Konfiguration relativ zum Projekt-Root
 ENV_FILE_REL=".env.local"
@@ -104,11 +109,82 @@ trap 'contao_cleanup_theme; contao_print_summary' EXIT
 # ----- Vorabprüfungen --------------------------------------------------------
 
 # PHP und UI-Backend werden in jedem Fall gebraucht - auch für eine
-# Grundinstallation, bei der es noch gar kein Projekt gibt. PHP_OVERRIDE_FILE
+# Grundinstallation, bei der es noch gar kein Projekt gibt. CONTAO_CONF_FILE
 # muss vor contao_resolve_php gesetzt sein, da eine dort gespeicherte
-# Auswahl Vorrang vor der automatischen Erkennung hat.
-PHP_OVERRIDE_FILE="$SCRIPT_DIR/$PHP_OVERRIDE_FILE_REL"
+# PHP-Auswahl Vorrang vor der automatischen Erkennung hat.
+CONTAO_CONF_FILE="$SCRIPT_DIR/$CONTAO_CONF_FILE_REL"
+
+# Einmalige, stille Migration von der alten (bis V1.0 genutzten) separaten
+# PHP-Override-Datei auf die neue, vereinheitlichte .contao.conf - damit auf
+# bereits im Einsatz befindlichen Projekten eine frühere PHP-Auswahl nicht
+# verloren geht.
+_contao_legacy_php_conf="$SCRIPT_DIR/.contao-sh-php.conf"
+if [ ! -f "$CONTAO_CONF_FILE" ] && [ -f "$_contao_legacy_php_conf" ]; then
+    _contao_legacy_php_bin="$(head -n1 "$_contao_legacy_php_conf" 2>/dev/null)"
+    if [ -n "$_contao_legacy_php_bin" ]; then
+        contao_env_set_value "PHP_BIN_SELECTED" "PHP_BIN_SELECTED=\"$_contao_legacy_php_bin\"" "$CONTAO_CONF_FILE" no_backup
+    fi
+    rm -f "$_contao_legacy_php_conf"
+fi
+unset _contao_legacy_php_conf _contao_legacy_php_bin
+
+# .contao.conf ist echtes Bash und wird per 'source' eingebunden (nicht nur
+# zeilenweise geparst) - kann dadurch neben einfachen KEY="VALUE"-Zeilen
+# (PHP_BIN_SELECTED, TESTMAIL_FROM, TESTMAIL_TO) bei Bedarf auch ein
+# komplettes EXTENSIONS_LIST-Array enthalten, das die Vorgabe oben im
+# Konfig-Block überschreibt. Nur eine vom Tool selbst gepflegte/lesbare
+# Datei im Projekt-Root, kein externer Input.
+if [ -f "$CONTAO_CONF_FILE" ]; then
+    # shellcheck source=/dev/null
+    source "$CONTAO_CONF_FILE"
+fi
+
 contao_resolve_php
+
+# Existiert .contao.conf noch nicht (auch nicht durch die Migration oben
+# angelegt), wird sie jetzt einmalig mit den aktuellen Werten vorbefüllt -
+# PHP_BIN_SELECTED mit der gerade automatisch ermittelten (zu REQUIRED_PHP
+# passenden) PHP-Version, TESTMAIL_FROM/TESTMAIL_TO mit den Defaults aus
+# dem Konfig-Block. So liegt von Anfang an eine sichtbare, direkt editierbare
+# Datei vor statt erst nach der ersten Menü-Interaktion.
+if [ ! -f "$CONTAO_CONF_FILE" ]; then
+    cat > "$CONTAO_CONF_FILE" << EOF
+# Contao PfeilShell - projektspezifische Konfiguration.
+# Wird von contao.sh per 'source' eingebunden - gültiges Bash, kein reines
+# Zeilenformat. Überschreibt bei Bedarf die Standard-Werte aus dem
+# Konfig-Block von contao.sh, ohne contao.sh selbst anzufassen.
+TESTMAIL_FROM="$TESTMAIL_FROM_DEFAULT"
+TESTMAIL_TO="$TESTMAIL_TO_DEFAULT"
+
+# Erweiterungen für "Erweiterungen installieren/entfernen". Frei anpassbar -
+# Zeilen ergänzen, ändern oder löschen. Format je Zeile:
+# "Composer-Paket|Kurzbeschreibung"
+EXTENSIONS_LIST=(
+    "madeyourday/contao-rocksolid-custom-elements|RockSolid Custom Elements - Basis für eigene Content-Elemente"
+    "madeyourday/contao-rocksolid-frontend-helper|RockSolid Frontend-Helper - Debug-/Diagnose-Hilfen im Frontend"
+    "terminal42/contao-leads|Contao Leads - Formular-/Lead-Erfassung"
+    "terminal42/notification_center|Notification Center - zentrales Benachrichtigungs-/Mailsystem"
+    "terminal42/contao-changelanguage|Changelanguage - Sprachumschalter mehrsprachiger Seiten"
+    "terminal42/contao-url-rewrite|URL Rewrite - Weiterleitungen/Rewrites verwalten"
+    "terminal42/contao-fineuploader|Fine Uploader - Datei-Upload-Widget im Frontend"
+    "codesache/contao-backend-user-style-bundle|Backend User Style Bundle - individuelles Backend-Farbschema"
+    "erdmannfreunde/contao-grid-bundle|Grid Bundle - Grid-System für Layout-Sections"
+    "erdmannfreunde/theme-toolbox|Theme Toolbox - Helferlein-Bundle fürs Theme"
+    "codefog/contao-news_categories|News Categories - Kategorien für die News-Erweiterung"
+)
+EOF
+    # PHP_BIN_SELECTED nur eintragen, wenn beim Erstaufruf tatsächlich ein
+    # PHP-Binary gefunden wurde (contao_resolve_php oben) - so landet nie ein
+    # leerer Wert in der Datei. Wurde nichts gefunden, bleibt die Zeile weg
+    # und jeder weitere Aufruf versucht die automatische Erkennung erneut,
+    # bis entweder ein PHP gefunden wird oder der Nutzer es manuell über
+    # "PHP-Version wählen" festlegt.
+    if [ -n "${PHP_BIN:-}" ]; then
+        contao_env_set_value "PHP_BIN_SELECTED" "PHP_BIN_SELECTED=\"$PHP_BIN\"" "$CONTAO_CONF_FILE" no_backup
+        PHP_BIN_SELECTED="$PHP_BIN"
+    fi
+    contao_log "Projektspezifische $CONTAO_CONF_FILE_REL neu angelegt (PHP: ${PHP_BIN:-nicht gefunden})"
+fi
 
 contao_detect_dialog
 
@@ -370,7 +446,7 @@ action_php_select() {
     done
 
     menu_args+=("m" "Manuell: vollen Pfad eingeben")
-    if [ -f "$PHP_OVERRIDE_FILE" ]; then
+    if [ -n "${PHP_BIN_SELECTED:-}" ]; then
         menu_args+=("a" "Automatische Erkennung verwenden (Auswahl zurücksetzen)")
     fi
     menu_args+=("0" "Abbrechen")
@@ -381,7 +457,8 @@ action_php_select() {
     [ "$choice" = "0" ] && { contao_pause; return; }
 
     if [ "$choice" = "a" ]; then
-        rm -f "$PHP_OVERRIDE_FILE"
+        contao_env_unset_value "PHP_BIN_SELECTED" "$CONTAO_CONF_FILE"
+        PHP_BIN_SELECTED=""
         contao_resolve_php
         contao_refresh_php_dependents
         echo ""
@@ -410,12 +487,13 @@ action_php_select() {
         fi
     fi
 
-    echo "$new_bin" > "$PHP_OVERRIDE_FILE"
+    contao_env_set_value "PHP_BIN_SELECTED" "PHP_BIN_SELECTED=\"$new_bin\"" "$CONTAO_CONF_FILE" no_backup
+    PHP_BIN_SELECTED="$new_bin"
     PHP_BIN="$new_bin"
     contao_refresh_php_dependents
     echo ""
     echo "${C_GREEN}PHP-Version gesetzt: $PHP_BIN${C_RESET}"
-    echo "Gespeichert in $PHP_OVERRIDE_FILE_REL - bleibt bei künftigen Aufrufen erhalten,"
+    echo "Gespeichert in $CONTAO_CONF_FILE_REL - bleibt bei künftigen Aufrufen erhalten,"
     echo "bis hier wieder auf automatische Erkennung zurückgesetzt wird."
     contao_log "PHP-Version manuell gesetzt: $PHP_BIN"
     contao_pause
@@ -538,39 +616,63 @@ action_install_extensions() {
     contao_pause
 }
 
-# Durchsucht EXTENSIONS_LIST nach einem Stichwort (Paketname oder
-# Beschreibung, Groß-/Kleinschreibung egal), zeigt die Treffer als
+# Durchsucht ausschließlich Packagist (composer search) nach einem
+# Stichwort - NICHT die lokale EXTENSIONS_LIST. Zeigt die Treffer als
 # Checkbox-Auswahl und installiert die gewählten Pakete per composer
 # require (Dry-Run oder direkt, wie bei "Erweiterungen installieren").
 action_extensions_search() {
     local term
-    term="$(contao_inputbox "Erweiterungen suchen" "Suchbegriff (Name oder Stichwort, leer = abbrechen):" "")"
+    term="$(contao_inputbox "Erweiterungen suchen" "Suchbegriff (Paketname oder Stichwort, sucht auf Packagist, leer = abbrechen):" "")"
     if [ -z "$term" ]; then
         return
     fi
 
+    echo ""
+    echo "Suche auf Packagist nach \"$term\" (nur Contao-Erweiterungen, Typ contao-bundle) ..."
+    local raw
+    # --type=contao-bundle grenzt auf Pakete mit Contao-Manager-Bundle-Typ
+    # ein - der Standard-Composer-Typ, den Contao-Erweiterungen im
+    # composer.json (`"type": "contao-bundle"`) angeben. Filtert dadurch
+    # Treffer ohne Contao-Bezug zuverlässig heraus.
+    raw="$("${COMPOSER_CMD[@]-}" search --type=contao-bundle "$term" 2>/dev/null)"
+
     local checklist_args=() matches=0
-    local entry pkg desc term_lc entry_lc
-    term_lc="$(echo "$term" | tr '[:upper:]' '[:lower:]')"
-    for entry in "${EXTENSIONS_LIST[@]-}"; do
-        pkg="${entry%%|*}"
-        desc="${entry#*|}"
-        entry_lc="$(echo "$pkg $desc" | tr '[:upper:]' '[:lower:]')"
-        case "$entry_lc" in
-            *"$term_lc"*)
-                checklist_args+=("$pkg" "$desc" "off")
-                matches=$((matches + 1))
-                ;;
-        esac
-    done
+    local line pkg desc max_matches=40
+    if [ -n "$raw" ]; then
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            pkg="${line%% *}"
+            desc="${line#* }"
+            [ "$pkg" = "$desc" ] && desc=""
+            # Nur Zeilen übernehmen, die wie ein echter Composer-Paketname
+            # ("vendor/paket") aussehen - filtert eventuelle Warn-/Hinweis-
+            # zeilen von Composer heraus.
+            case "$pkg" in
+                */*/*) continue ;;
+                */*) ;;
+                *) continue ;;
+            esac
+            # Paketname sichtbar voranstellen - die Checkbox-Liste zeigt nur
+            # die Beschreibung an, ohne das würde der Paketname (vendor/name)
+            # beim Suchergebnis gar nicht auftauchen.
+            if [ -n "$desc" ]; then
+                desc="$pkg - $desc"
+            else
+                desc="$pkg"
+            fi
+            checklist_args+=("$pkg" "$desc" "off")
+            matches=$((matches + 1))
+            [ "$matches" -ge "$max_matches" ] && break
+        done <<< "$raw"
+    fi
 
     if [ "$matches" -eq 0 ]; then
-        contao_msgbox "Erweiterungen suchen" "Keine Treffer für \"$term\"."
+        contao_msgbox "Erweiterungen suchen" "Keine Treffer für \"$term\" auf Packagist (oder keine Internetverbindung)."
         return
     fi
 
     local selection
-    selection="$(contao_checklist "Erweiterungen suchen: \"$term\" ($matches Treffer)" \
+    selection="$(contao_checklist "Erweiterungen suchen: \"$term\" ($matches Treffer, Packagist)" \
         "Mit Leertaste oder Zifferntaste an-/abwählen, danach \"Fertig\" bestätigen:" "${checklist_args[@]-}")"
     if [ -z "$selection" ]; then
         contao_msgbox "Erweiterungen suchen" "Keine Auswahl getroffen - nichts installiert."
@@ -680,9 +782,24 @@ action_crawl() {
 }
 
 action_testmail() {
-    local from to
-    from="$(contao_inputbox "Test-Mail" "Absender (--from):" "$TESTMAIL_FROM_DEFAULT")" || { echo "Abgebrochen."; contao_pause; return; }
-    to="$(contao_inputbox "Test-Mail" "Empfänger (--to):" "$TESTMAIL_TO_DEFAULT")" || { echo "Abgebrochen."; contao_pause; return; }
+    local default_from default_to from to
+    # TESTMAIL_FROM/TESTMAIL_TO kommen - falls in .contao.conf gesetzt -
+    # bereits als fertige Variablen aus dem 'source' beim Start.
+    default_from="${TESTMAIL_FROM:-$TESTMAIL_FROM_DEFAULT}"
+    default_to="${TESTMAIL_TO:-$TESTMAIL_TO_DEFAULT}"
+
+    from="$(contao_inputbox "Test-Mail" "Absender (--from):" "$default_from")" || { echo "Abgebrochen."; contao_pause; return; }
+    to="$(contao_inputbox "Test-Mail" "Empfänger (--to):" "$default_to")" || { echo "Abgebrochen."; contao_pause; return; }
+
+    if [ "$from" != "$default_from" ] || [ "$to" != "$default_to" ]; then
+        if contao_yesno "Als Standard speichern?" "Absender/Empfänger für dieses Projekt in $CONTAO_CONF_FILE_REL als neuen Standard speichern?"; then
+            contao_env_set_value "TESTMAIL_FROM" "TESTMAIL_FROM=\"$from\"" "$CONTAO_CONF_FILE" no_backup
+            contao_env_set_value "TESTMAIL_TO" "TESTMAIL_TO=\"$to\"" "$CONTAO_CONF_FILE" no_backup
+            TESTMAIL_FROM="$from"
+            TESTMAIL_TO="$to"
+            echo "Gespeichert in $CONTAO_CONF_FILE_REL."
+        fi
+    fi
 
     contao_run "Test-Mail von $from an $to" "${CONSOLE_CMD[@]-}" mailer:send \
         --from="$from" --to="$to" --subject=testmail --body=testmail
@@ -957,7 +1074,7 @@ while true; do
         14 "Composer Update (alle Pakete aktualisieren)" \
         "#" "Erweiterungen" \
         15 "Erweiterungen installieren (Checkbox-Auswahl)" \
-        16 "Erweiterungen suchen" \
+        16 "Erweiterungen suchen (Packagist)" \
         17 "Erweiterungen entfernen (composer remove)" \
         "#" "Werkzeuge" \
         18 "Dateiverwaltung abgleichen (contao:filesync)" \
