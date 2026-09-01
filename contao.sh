@@ -86,9 +86,11 @@ FRESH_INSTALL_VERSIONS=(
 # ============================================================================
 
 # Versionsnummer der Toolbox - erscheint im Hauptmenü-Titel
-# ("=== Contao PfeilShell - V1.0 ==="). Bei Änderungen an contao.sh/
-# _contao-lib.sh hier hochzählen.
-CONTAO_SH_VERSION="1.0"
+# ("=== Contao PfeilShell - V1.1.0 ==="). Schema MAJOR.MINOR.PATCH - bei
+# jeder Änderung an contao.sh/_contao-lib.sh die PATCH-Stelle hochzählen
+# (1.1.0 -> 1.1.1 -> 1.1.2 ...), bei größeren Feature-Sprüngen die
+# MINOR-Stelle.
+CONTAO_SH_VERSION="1.1.0"
 TOOL_TITLE="Contao PfeilShell - V${CONTAO_SH_VERSION}"
 
 set -u
