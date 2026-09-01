@@ -1,0 +1,21 @@
+# Composer (falls hier je ein composer.json für Tooling dazukommt)
+vendor/
+composer.lock
+
+# macOS / Editoren
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# contao.sh-eigene Laufzeit-/Maschinen-Artefakte (host-spezifisch, nicht
+# fürs Repo gedacht)
+.contao-sh-php.conf
+*.log
+.pfeilshell-install.*
+
+# Lokale Notizen / Tools
+git-commit.txt
+release.sh
+TEMP/
