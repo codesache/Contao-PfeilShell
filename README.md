@@ -43,7 +43,7 @@ projekteigenen Daten fest im Code.
 Ausführliche technische Dokumentation (alle Menüpunkte im Detail,
 `.contao.conf`-Mechanik, PHP-Erkennung & Kompatibilitäts-Check,
 Statuszeile, Farbschema, Testprotokoll, Design-Entscheidungen): siehe
-[README-PfeilShell.md](README-PfeilShell.md).
+README-PfeilShell.md.
 
 ---
 
