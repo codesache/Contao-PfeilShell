@@ -32,6 +32,18 @@
 # Bedarf pro Projekt hier anpassen (z.B. auf "8.1" senken).
 REQUIRED_PHP="8.4"
 
+# Min/Max-PHP-Empfehlung je Contao-Branch (grober Richtwert, keine harte
+# Grenze - nur Warnung, siehe contao_php_compat_check in _contao-lib.sh).
+# Composer selbst lässt oft auch neuere PHP-Versionen zu, ohne dass die
+# jeweilige Contao-Version tatsächlich dafür getestet/freigegeben ist (siehe
+# z.B. Contao 5.3: offiziell "PHP 8.1+" ohne echte Obergrenze in
+# composer.json). Format je Zeile: "Branch|MinPHP|MaxEmpfohlenPHP"
+CONTAO_PHP_COMPAT=(
+    "5.3|8.1|8.4"
+    "5.7|8.3|8.4"
+    "6.0|8.4|8.4"
+)
+
 # Nur setzen, falls PHP weder im PATH noch unter den bekannten MAMP-/
 # Server-Standardpfaden automatisch gefunden wird (siehe _contao-lib.sh):
 # voller Pfad zum php-Binary, z.B.
@@ -90,7 +102,7 @@ FRESH_INSTALL_VERSIONS=(
 # jeder Änderung an contao.sh/_contao-lib.sh die PATCH-Stelle hochzählen
 # (1.1.0 -> 1.1.1 -> 1.1.2 ...), bei größeren Feature-Sprüngen die
 # MINOR-Stelle.
-CONTAO_SH_VERSION="1.1.0"
+CONTAO_SH_VERSION="1.2.0"
 TOOL_TITLE="Contao PfeilShell - V${CONTAO_SH_VERSION}"
 
 set -u
@@ -142,6 +154,17 @@ if [ -f "$CONTAO_CONF_FILE" ]; then
 fi
 
 contao_resolve_php
+
+# Live-Check pro Start: welche PHP-Version ist gerade tatsächlich aktiv,
+# passt das zur installierten Contao-Version (CONTAO_PHP_COMPAT)? Läuft
+# bewusst VOR dem Schreiben in .contao.conf (siehe unten) - reine Warnung,
+# blockiert nichts, aber macht eine falsch eingestellte PHP-Version (z.B.
+# nach einem Hoster-Wechsel der Standardversion) sofort sichtbar, statt sie
+# stillschweigend zu übernehmen.
+contao_php_compat_check "$SCRIPT_DIR"
+if [ "$CONTAO_SH_PHP_COMPAT_STATUS" = "low" ] || [ "$CONTAO_SH_PHP_COMPAT_STATUS" = "high" ]; then
+    echo "${C_ORANGE}WARNUNG: $CONTAO_SH_PHP_COMPAT_MSG${C_RESET}" >&2
+fi
 
 # Existiert .contao.conf noch nicht (auch nicht durch die Migration oben
 # angelegt), wird sie jetzt einmalig mit den aktuellen Werten vorbefüllt -
@@ -223,29 +246,23 @@ action_fresh_install() {
         fi
     fi
 
-    # composer.phar im Zielordner hat Vorrang (wird initial oft manuell
-    # abgelegt, gerade auf Hosting ohne globales Composer). Danach ein
-    # globales 'composer' als Fallback, zuletzt automatischer Download
-    # der composer.phar (siehe contao_download_composer_phar).
+    # Bewusst OHNE Fallback auf ein globales 'composer' im PATH - siehe
+    # Kommentar bei contao_resolve_composer() in _contao-lib.sh. composer.phar
+    # im Zielordner hat Vorrang (wird initial oft manuell abgelegt), sonst
+    # automatischer Download.
     if [ -f "$SCRIPT_DIR/composer.phar" ]; then
         fresh_composer_cmd=("$PHP_BIN" "$SCRIPT_DIR/composer.phar")
         composer_desc="php composer.phar"
         echo ""
         echo "Verwende lokale composer.phar: $SCRIPT_DIR/composer.phar"
-    elif command -v composer >/dev/null 2>&1; then
-        fresh_composer_cmd=(composer)
-        composer_desc="composer"
-        echo ""
-        echo "Keine composer.phar im Ordner gefunden - verwende globales 'composer'."
     elif contao_download_composer_phar "$SCRIPT_DIR"; then
         fresh_composer_cmd=("$PHP_BIN" "$SCRIPT_DIR/composer.phar")
         composer_desc="php composer.phar"
     else
         echo ""
-        echo "FEHLER: Weder eine composer.phar in $SCRIPT_DIR noch ein globales 'composer'" >&2
-        echo "        gefunden, und der automatische Download ist fehlgeschlagen." >&2
-        echo "        composer.phar manuell ablegen oder Composer global installieren:" >&2
-        echo "        https://getcomposer.org" >&2
+        echo "FEHLER: Keine composer.phar in $SCRIPT_DIR gefunden, und der" >&2
+        echo "        automatische Download ist fehlgeschlagen." >&2
+        echo "        composer.phar manuell ablegen: https://getcomposer.org" >&2
         contao_pause
         return 1
     fi
@@ -351,7 +368,9 @@ fi
 # rc=2 -> nur Warnung, weiter gehts
 
 if ! contao_resolve_composer "$PROJECT_ROOT"; then
-    echo "FEHLER: Weder composer.phar im Projekt-Root noch ein globales 'composer' gefunden." >&2
+    echo "FEHLER: Keine composer.phar im Projekt-Root gefunden, und der automatische" >&2
+    echo "        Download ist fehlgeschlagen. composer.phar manuell ablegen:" >&2
+    echo "        https://getcomposer.org" >&2
     exit 1
 fi
 
@@ -515,6 +534,27 @@ action_composer_show_updates() {
 
 action_composer_version() {
     contao_run "composer -V" "${COMPOSER_CMD[@]-}" -V
+    contao_pause
+}
+
+action_composer_phar_download() {
+    local target="$PROJECT_ROOT/composer.phar" prompt
+    if [ -f "$target" ]; then
+        prompt="Vorhandene composer.phar unter\n$target\ndurch die aktuelle Version von getcomposer.org ersetzen?"
+    else
+        prompt="composer.phar von getcomposer.org herunterladen und unter\n$target\nablegen?"
+    fi
+    if ! contao_yesno "composer.phar herunterladen" "$prompt"; then
+        echo "Abgebrochen."
+        contao_pause
+        return
+    fi
+
+    echo ""
+    if contao_download_composer_phar "$PROJECT_ROOT"; then
+        contao_resolve_composer "$PROJECT_ROOT"
+        contao_log "composer.phar heruntergeladen/aktualisiert: $target"
+    fi
     contao_pause
 }
 
@@ -957,10 +997,20 @@ action_backup_restore() {
         return
     fi
 
+    # Bewusst über eine temporäre Datei statt Prozess-Substitution (< <(...)) -
+    # Prozess-Substitution braucht /dev/fd/*, das auf manchen (insbesondere
+    # eingeschränkten/gejailten) Hosting-Shells fehlt und dann mit
+    # "/dev/fd/NN: Datei oder Verzeichnis nicht gefunden" abbricht. Eine
+    # normale temporäre Datei funktioniert überall.
     local -a files=()
+    local _backup_list_tmp
+    _backup_list_tmp="$(mktemp 2>/dev/null || echo "/tmp/contao-sh-backups.$$")"
+    (cd "$BACKUP_DIR" && ls -t 2>/dev/null | grep -E '\.sql(\.gz)?$') > "$_backup_list_tmp"
     while IFS= read -r f; do
         files+=("$f")
-    done < <(cd "$BACKUP_DIR" && ls -t 2>/dev/null | grep -E '\.sql(\.gz)?$')
+    done < "$_backup_list_tmp"
+    rm -f "$_backup_list_tmp"
+    unset _backup_list_tmp
 
     if [ ${#files[@]} -eq 0 ]; then
         contao_msgbox "Restore" "Keine Backups gefunden in:\n$BACKUP_DIR"
@@ -1045,6 +1095,9 @@ action_migrate_debug_menu() {
 # allerersten Aufruf des Hauptmenüs in dieser Sitzung, nicht bei jeder
 # Rückkehr aus einem Untermenü.
 CONTAO_SH_PATH_LINE="Pfad: $PROJECT_ROOT"
+# Statuszeile (PHP/Composer-Segment-Balken) einmalig pro Skriptlauf bauen,
+# nicht bei jedem Menü-Redraw (siehe contao_build_status_line).
+contao_build_status_line
 MAIN_MENU_INTRO_FULL="Deine pfeilschnelle Kommandozentrale für Update, Installation, Migration, Cache und viele weitere Helferchen."
 MAIN_MENU_INTRO_SHORT=""
 main_menu_shown=0
@@ -1057,38 +1110,38 @@ while true; do
         main_menu_prompt="$MAIN_MENU_INTRO_SHORT"
     fi
     choice="$(contao_menu "$TOOL_TITLE" "$main_menu_prompt" \
-        "#" "Migrate & Cache" \
-        1  "Migrate (mit automatischem Backup)" \
-        2  "Migrate ohne Backup" \
-        3  "Cache leeren" \
-        4  "Cache leeren (prod + dev)" \
-        5  "Cache leeren + Migrate" \
         "#" "System" \
-        6  "PHP-Info anzeigen" \
-        7  "PHP-Version wählen" \
+        1  "PHP-Info anzeigen" \
+        2  "PHP-Version wählen" \
         "#" "Composer" \
-        8  "Composer: installierte Pakete anzeigen" \
-        9  "Composer: verfügbare Updates anzeigen (show -l)" \
-        10 "Composer Version anzeigen" \
-        11 "Composer Selfupdate" \
-        12 "Composer Update (mit Memory-Profil)" \
-        13 "Composer Update (Dry-Run / Testlauf)" \
-        14 "Composer Update (alle Pakete aktualisieren)" \
+        3  "Composer: installierte Pakete anzeigen" \
+        4  "Composer: verfügbare Updates anzeigen (show -l)" \
+        5  "Composer Version anzeigen" \
+        6  "composer.phar herunterladen/aktualisieren" \
+        7  "Composer Selfupdate" \
+        8  "Composer Update (mit Memory-Profil)" \
+        9  "Composer Update (Dry-Run / Testlauf)" \
+        10 "Composer Update (alle Pakete aktualisieren)" \
+        "#" "Cache" \
+        11 "Cache leeren" \
+        12 "Cache leeren (prod + dev)" \
+        "#" "Datenbank + Migration" \
+        13 "Migrate (mit automatischem Backup)" \
+        14 "Migrate ohne Backup" \
+        15 "Cache leeren + Migrate" \
+        16 "Datenbank sichern (contao:backup:create)" \
+        17 "Vorhandene Backups auflisten (contao:backup:list)" \
+        18 "Datenbank aus Backup wiederherstellen (contao:backup:restore)" \
+        19 "Migrate-Debugging (Dry-Run-Varianten)" \
         "#" "Erweiterungen" \
-        15 "Erweiterungen installieren (Checkbox-Auswahl)" \
-        16 "Erweiterungen suchen (Packagist)" \
-        17 "Erweiterungen entfernen (composer remove)" \
+        20 "Erweiterungen installieren (Checkbox-Auswahl)" \
+        21 "Erweiterungen suchen (Packagist)" \
+        22 "Erweiterungen entfernen (composer remove)" \
         "#" "Werkzeuge" \
-        18 "Dateiverwaltung abgleichen (contao:filesync)" \
-        19 "Suchindex aufbauen (contao:crawl)" \
-        20 "Test-E-Mail versenden (mailer:send)" \
-        "#" "Konfiguration" \
-        21 "$ENV_FILE_REL konfigurieren (DATABASE_URL / MAILER_DSN)" \
-        "#" "Datenbank" \
-        22 "Datenbank sichern (contao:backup:create)" \
-        23 "Vorhandene Backups auflisten (contao:backup:list)" \
-        24 "Datenbank aus Backup wiederherstellen (contao:backup:restore)" \
-        25 "Migrate-Debugging (Dry-Run-Varianten)" \
+        23 "Dateiverwaltung abgleichen (contao:filesync)" \
+        24 "Suchindex aufbauen (contao:crawl)" \
+        25 "Test-E-Mail versenden (mailer:send)" \
+        26 "$ENV_FILE_REL konfigurieren (DATABASE_URL / MAILER_DSN)" \
         0  "Beenden")"
 
     # Leere/ungültige Eingabe (z.B. ESC bei dialog/whiptail, Tippfehler im
@@ -1097,31 +1150,32 @@ while true; do
     [ -z "$choice" ] && continue
 
     case "$choice" in
-        1) action_migrate_backup ;;
-        2) action_migrate_nobackup ;;
-        3) action_cache_clear ;;
-        4) action_cache_clear_both ;;
-        5) action_cache_migrate ;;
-        6) action_phpinfo ;;
-        7) action_php_select ;;
-        8) action_composer_show ;;
-        9) action_composer_show_updates ;;
-        10) action_composer_version ;;
-        11) action_composer_selfupdate ;;
-        12) action_composer_update_profile ;;
-        13) action_composer_update_dryrun ;;
-        14) action_composer_update_all ;;
-        15) action_install_extensions ;;
-        16) action_extensions_search ;;
-        17) action_extensions_remove ;;
-        18) action_filesync ;;
-        19) action_crawl ;;
-        20) action_testmail ;;
-        21) action_env_menu ;;
-        22) action_backup_create ;;
-        23) action_backup_list ;;
-        24) action_backup_restore ;;
-        25) action_migrate_debug_menu ;;
+        1) action_phpinfo ;;
+        2) action_php_select ;;
+        3) action_composer_show ;;
+        4) action_composer_show_updates ;;
+        5) action_composer_version ;;
+        6) action_composer_phar_download ;;
+        7) action_composer_selfupdate ;;
+        8) action_composer_update_profile ;;
+        9) action_composer_update_dryrun ;;
+        10) action_composer_update_all ;;
+        11) action_cache_clear ;;
+        12) action_cache_clear_both ;;
+        13) action_migrate_backup ;;
+        14) action_migrate_nobackup ;;
+        15) action_cache_migrate ;;
+        16) action_backup_create ;;
+        17) action_backup_list ;;
+        18) action_backup_restore ;;
+        19) action_migrate_debug_menu ;;
+        20) action_install_extensions ;;
+        21) action_extensions_search ;;
+        22) action_extensions_remove ;;
+        23) action_filesync ;;
+        24) action_crawl ;;
+        25) action_testmail ;;
+        26) action_env_menu ;;
         0) break ;;
         *) : ;;
     esac

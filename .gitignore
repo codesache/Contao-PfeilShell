@@ -15,6 +15,7 @@ composer.lock
 .contao-sh-php.conf
 *.log
 .pfeilshell-install.*
+README-PfeilShell.md
 
 # Lokale Notizen / Tools
 git-commit.txt

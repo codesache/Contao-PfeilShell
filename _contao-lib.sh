@@ -30,6 +30,9 @@ contao_setup_colors() {
         C_LOGO_CODE=""
         C_LOGO_SACHE=""
         C_SELECT=""
+        C_BG_GREEN=""
+        C_BG_ORANGE=""
+        C_BG_GREY=""
         return
     fi
     C_RESET=$'\033[0m'
@@ -45,6 +48,12 @@ contao_setup_colors() {
     # gleiche Blau wie "Code" im Logo (#1d70b7), fett für Kontrast - nicht
     # C_ORANGE, das bleibt Titeln/Überschriften/Warnungen vorbehalten.
     C_SELECT=$'\033[1;38;2;29;112;183m'
+    # Hintergrundfarben für die segmentierte Statuszeile (echte "Blöcke"
+    # statt nur eingefärbtem Text) - schwarzer Text auf grün/orange, weißer
+    # Text auf dunkelgrau für neutrale Info-Segmente (PHP-/Composer-Version).
+    C_BG_GREEN=$'\033[1;30;48;2;80;200;120m'
+    C_BG_ORANGE=$'\033[1;30;48;2;244;124;0m'
+    C_BG_GREY=$'\033[1;37;48;2;60;60;60m'
 }
 contao_setup_colors
 
@@ -337,6 +346,165 @@ contao_resolve_php() {
     return 1
 }
 
+# ---------------------------------------------------------------------------
+# Ermittelt den Contao-Branch (z.B. "5.3") der installierten contao/core-
+# bundle-Version direkt aus composer.lock - bewusst ohne Composer-Aufruf
+# (kein Bootstrap-Overhead), damit das bei jedem Start unbedenklich läuft.
+# ---------------------------------------------------------------------------
+contao_detect_contao_branch() {
+    local dir="$1" lock_file version
+    lock_file="$dir/composer.lock"
+    [ -f "$lock_file" ] || return 1
+    version="$(grep -A6 '"name": *"contao/core-bundle"' "$lock_file" 2>/dev/null \
+        | grep -m1 '"version"' \
+        | sed -E 's/.*"version": *"v?([^"]+)".*/\1/')"
+    [ -z "$version" ] && return 1
+    echo "$version" | cut -d. -f1,2
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Gleicht die aktuell aktive PHP-Version (PHP_BIN) gegen die für die
+# installierte Contao-Version bekannte Min/Max-Empfehlung ab
+# (CONTAO_PHP_COMPAT im Konfig-Block von contao.sh, Format
+# "Branch|MinPHP|MaxEmpfohlenPHP"). Reine Warnung, kein Blocker - Composer
+# selbst lässt eine zu neue PHP-Version ja meist ohnehin zu.
+# Setzt CONTAO_SH_PHP_COMPAT_STATUS: "ok" | "low" | "high" | "unknown"
+# und CONTAO_SH_PHP_COMPAT_MSG (Klartext, leer außer bei "low"/"high").
+# ---------------------------------------------------------------------------
+CONTAO_SH_PHP_COMPAT_STATUS="unknown"
+CONTAO_SH_PHP_COMPAT_MSG=""
+
+contao_php_compat_check() {
+    local dir="$1" branch entry e_branch e_min e_max
+    local php_ver php_num min_num max_num
+
+    CONTAO_SH_PHP_COMPAT_STATUS="unknown"
+    CONTAO_SH_PHP_COMPAT_MSG=""
+
+    [ -n "${PHP_BIN:-}" ] && [ -x "$PHP_BIN" ] || return 1
+    branch="$(contao_detect_contao_branch "$dir")" || return 1
+    [ -z "$branch" ] && return 1
+
+    for entry in "${CONTAO_PHP_COMPAT[@]-}"; do
+        e_branch="${entry%%|*}"
+        [ "$e_branch" = "$branch" ] || continue
+        e_min="$(echo "$entry" | cut -d'|' -f2)"
+        e_max="$(echo "$entry" | cut -d'|' -f3)"
+
+        php_ver="$("$PHP_BIN" -r 'echo PHP_VERSION;' 2>/dev/null)"
+        [ -z "$php_ver" ] && return 1
+        # Vergleich bewusst nur auf Major.Minor-Ebene (Patch-Version
+        # ignorieren) - CONTAO_PHP_COMPAT-Einträge sind Branches wie "8.4",
+        # nicht einzelne Patch-Versionen. Sonst würde z.B. PHP 8.4.23 fälschlich
+        # als "höher als empfohlenes Maximum 8.4" gewertet.
+        php_num="$(_contao_php_ver_to_num "$(echo "$php_ver" | cut -d. -f1,2)")"
+        min_num="$(_contao_php_ver_to_num "$e_min")"
+        max_num="$(_contao_php_ver_to_num "$e_max")"
+
+        if [ "$php_num" -lt "$min_num" ]; then
+            CONTAO_SH_PHP_COMPAT_STATUS="low"
+            CONTAO_SH_PHP_COMPAT_MSG="PHP $php_ver ist niedriger als für Contao $branch benötigt (min. $e_min)."
+        elif [ "$php_num" -gt "$max_num" ]; then
+            CONTAO_SH_PHP_COMPAT_STATUS="high"
+            CONTAO_SH_PHP_COMPAT_MSG="PHP $php_ver ist neuer als für Contao $branch offiziell erprobt (empfohlen bis $e_max) - auf Kompatibilität prüfen."
+        else
+            CONTAO_SH_PHP_COMPAT_STATUS="ok"
+        fi
+        return 0
+    done
+
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Wandelt einen php.ini memory_limit-Wert ("512M", "1G", "-1", Bytes ohne
+# Suffix) in MB um. "-1" (unbegrenzt) wird unverändert als "-1" zurückgegeben.
+# ---------------------------------------------------------------------------
+_contao_mem_to_mb() {
+    local v="$1" num unit
+    case "$v" in
+        -1|"") echo -1; return ;;
+    esac
+    unit="${v: -1}"
+    case "$unit" in
+        [Gg]) num="${v%[Gg]}"; num="${num//[!0-9]/}"; echo $(( ${num:-0} * 1024 )) ;;
+        [Mm]) num="${v%[Mm]}"; num="${num//[!0-9]/}"; echo "${num:-0}" ;;
+        [Kk]) num="${v%[Kk]}"; num="${num//[!0-9]/}"; echo $(( ${num:-0} / 1024 )) ;;
+        *) num="${v//[!0-9]/}"; echo $(( ${num:-1048576} / 1048576 )) ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Baut die Statuszeile (PHP-Version, memory_limit/max_execution_time/
+# max_input_vars, Composer-Version) als durchgehenden Segment-Balken -
+# einmal pro Skriptlauf in CONTAO_SH_STATUS_LINE berechnet, nicht bei jedem
+# Menü-Redraw (Composer-Bootstrap ist zu langsam für "bei jedem Pfeiltasten-
+# Druck neu"). Composer-Version wird an die composer.phar-mtime gekoppelt in
+# .contao.conf gecacht - nur bei tatsächlicher Änderung (Selfupdate, neuer
+# Download) neu ermittelt.
+# ---------------------------------------------------------------------------
+CONTAO_SH_STATUS_LINE=""
+
+contao_build_status_line() {
+    CONTAO_SH_STATUS_LINE=""
+    [ -n "${PHP_BIN:-}" ] && [ -x "$PHP_BIN" ] || return 1
+
+    local php_ver ini_raw mem_limit max_exec max_vars
+    php_ver="$("$PHP_BIN" -r 'echo PHP_VERSION;' 2>/dev/null)"
+    ini_raw="$("$PHP_BIN" -r 'echo ini_get("memory_limit"),"|",ini_get("max_execution_time"),"|",ini_get("max_input_vars");' 2>/dev/null)"
+    mem_limit="$(echo "$ini_raw" | cut -d'|' -f1)"
+    max_exec="$(echo "$ini_raw" | cut -d'|' -f2)"
+    max_vars="$(echo "$ini_raw" | cut -d'|' -f3)"
+
+    local mem_mb mem_col exec_col vars_col php_col
+    mem_mb="$(_contao_mem_to_mb "$mem_limit")"
+    if [ "$mem_mb" = "-1" ] || [ "${mem_mb:-0}" -ge 256 ] 2>/dev/null; then
+        mem_col="$C_BG_GREEN"
+    else
+        mem_col="$C_BG_ORANGE"
+    fi
+    if [ "${max_exec:-0}" = "0" ] || { [ -n "${max_exec:-}" ] && [ "$max_exec" -ge 300 ] 2>/dev/null; }; then
+        exec_col="$C_BG_GREEN"
+    else
+        exec_col="$C_BG_ORANGE"
+    fi
+    if [ -n "$max_vars" ] && [ "$max_vars" -ge 1000 ] 2>/dev/null; then
+        vars_col="$C_BG_GREEN"
+    else
+        vars_col="$C_BG_ORANGE"
+    fi
+    if [ "$CONTAO_SH_PHP_COMPAT_STATUS" = "low" ] || [ "$CONTAO_SH_PHP_COMPAT_STATUS" = "high" ]; then
+        php_col="$C_BG_ORANGE"
+    else
+        php_col="$C_BG_GREY"
+    fi
+
+    # Composer-Version: gecacht in .contao.conf, gekoppelt an die mtime der
+    # composer.phar - "composer -V" ist deutlich langsamer als ein reiner
+    # "php -r"-Aufruf (Composer-Bootstrap-Overhead), deshalb nicht bei jedem
+    # Start neu ermitteln, sondern nur wenn sich composer.phar geändert hat.
+    local composer_ver="" composer_sig="" phar_path
+    if [ -n "${COMPOSER_CMD+x}" ] && [ "${#COMPOSER_CMD[@]}" -ge 2 ]; then
+        phar_path="${COMPOSER_CMD[1]}"
+        [ -f "$phar_path" ] && composer_sig="$(date -r "$phar_path" '+%s' 2>/dev/null)"
+    fi
+    if [ -n "$composer_sig" ] && [ "$composer_sig" = "${CONTAO_SH_COMPOSER_VER_SIG:-}" ] && [ -n "${CONTAO_SH_COMPOSER_VER_CACHE:-}" ]; then
+        composer_ver="$CONTAO_SH_COMPOSER_VER_CACHE"
+    else
+        composer_ver="$("${COMPOSER_CMD[@]-}" -V 2>/dev/null | sed -E 's/^Composer version ([^ ]+).*/\1/')"
+        if [ -n "$composer_ver" ] && [ -n "$composer_sig" ] && [ -n "${CONTAO_CONF_FILE:-}" ]; then
+            contao_env_set_value "CONTAO_SH_COMPOSER_VER_CACHE" "CONTAO_SH_COMPOSER_VER_CACHE=\"$composer_ver\"" "$CONTAO_CONF_FILE" no_backup
+            contao_env_set_value "CONTAO_SH_COMPOSER_VER_SIG" "CONTAO_SH_COMPOSER_VER_SIG=\"$composer_sig\"" "$CONTAO_CONF_FILE" no_backup
+            CONTAO_SH_COMPOSER_VER_CACHE="$composer_ver"
+            CONTAO_SH_COMPOSER_VER_SIG="$composer_sig"
+        fi
+    fi
+
+    CONTAO_SH_STATUS_LINE="${php_col} PHP ${php_ver:-?} ${C_RESET}${mem_col} mem ${mem_limit:-?} ${C_RESET}${exec_col} exec ${max_exec:-?}s ${C_RESET}${vars_col} vars ${max_vars:-?} ${C_RESET}${C_BG_GREY} Composer ${composer_ver:-?} ${C_RESET}"
+    return 0
+}
+
 # WICHTIG: contao_resolve_php muss VOR contao_check_php aufgerufen werden,
 # und zwar direkt (nicht per "x=$(contao_resolve_php)") - sonst läuft die
 # Funktion in einer Subshell und das global gesetzte PHP_BIN geht beim
@@ -371,15 +539,16 @@ contao_check_php() {
 }
 
 # ---------------------------------------------------------------------------
-# composer.phar automatisch herunterladen, falls im Zielordner noch keine
-# vorhanden ist und auch kein globales 'composer' gefunden wurde - gerade
-# auf minimalen Hosting-Umgebungen ohne globales Composer praktisch, damit
-# contao.sh nicht mit einem reinen Fehler abbricht.
+# composer.phar (neu) herunterladen - wird sowohl automatisch genutzt (falls
+# im Zielordner noch keine composer.phar vorhanden ist, damit contao.sh nicht
+# mit einem reinen Fehler abbricht), als auch manuell über den Menüpunkt
+# "composer.phar herunterladen/aktualisieren", um eine vorhandene Datei
+# gezielt durch die aktuelle Version zu ersetzen.
 # ---------------------------------------------------------------------------
 contao_download_composer_phar() {
     local target_dir="$1" dest
     dest="$target_dir/composer.phar"
-    echo "Keine composer.phar gefunden - lade aktuelle Version nach $dest herunter ..." >&2
+    echo "Lade aktuelle composer.phar nach $dest herunter ..." >&2
     if command -v wget >/dev/null 2>&1; then
         wget -q -O "$dest" https://getcomposer.org/download/latest-stable/composer.phar 2>&2
     elif command -v curl >/dev/null 2>&1; then
@@ -402,19 +571,18 @@ contao_download_composer_phar() {
 # ---------------------------------------------------------------------------
 # Composer-Binary ermitteln (Array statt String wegen Pfaden mit Leerzeichen)
 # ---------------------------------------------------------------------------
-# Setzt das globale Array COMPOSER_CMD. Reihenfolge: lokale composer.phar
-# im Projekt-Root zuerst (wird oft initial ins Root gelegt, gerade auf
-# Hosting-Umgebungen ohne globales Composer), dann globales 'composer' im
-# PATH, zuletzt als Fallback automatischer Download der composer.phar.
-# Rückgabewert 1, wenn nichts gefunden bzw. auch der Download fehlschlägt.
+# Setzt das globale Array COMPOSER_CMD. Bewusst OHNE Fallback auf ein
+# globales 'composer' im PATH: Composer-
+# Aktionen (Updates, Installationen, Selfupdate) laufen ausschließlich über
+# eine composer.phar im Projekt-Root. Grund: ein globales 'composer' ist auf
+# Hosting-Umgebungen oft ein veraltetes Distro-Paket (apt/yum) mit alter
+# composer-runtime-api, das Contao-Abhängigkeiten nicht auflösen kann und
+# kein Selfupdate unterstützt - siehe genau dieses Fehlerbild in der Praxis.
+# Fehlt die composer.phar, wird sie automatisch heruntergeladen.
 contao_resolve_composer() {
     local root="$1"
     if [ -f "$root/composer.phar" ]; then
         COMPOSER_CMD=("${PHP_BIN:-php}" "$root/composer.phar")
-        return 0
-    fi
-    if command -v composer >/dev/null 2>&1; then
-        COMPOSER_CMD=(composer)
         return 0
     fi
     if contao_download_composer_phar "$root"; then
@@ -758,6 +926,7 @@ contao_menu_arrows() {
             # beim ersten Zeichnen, damit der Projektkontext immer sichtbar
             # bleibt. Wird von contao.sh global in CONTAO_SH_PATH_LINE gesetzt.
             [ -n "${CONTAO_SH_PATH_LINE:-}" ] && frame="${frame}${CONTAO_SH_PATH_LINE}"$'\n'
+            [ -n "${CONTAO_SH_STATUS_LINE:-}" ] && frame="${frame}${CONTAO_SH_STATUS_LINE}"$'\n'
             # Prompt-Text (z.B. der längere Intro-/Marketing-Satz) dagegen
             # nur beim ersten Zeichnen dieses Menüs zeigen - bei erneutem
             # Redraw durch Pfeiltasten-Navigation (selbe Sitzung) nicht
@@ -1001,6 +1170,7 @@ contao_checklist_arrows() {
             frame="${frame}${CONTAO_SH_LOGO_BLOCK:-}"
             frame="${frame}"$'\n'"${C_ORANGE}=== $title ===${C_RESET}"$'\n'
             [ -n "${CONTAO_SH_PATH_LINE:-}" ] && frame="${frame}${CONTAO_SH_PATH_LINE}"$'\n'
+            [ -n "${CONTAO_SH_STATUS_LINE:-}" ] && frame="${frame}${CONTAO_SH_STATUS_LINE}"$'\n'
             [ "$first_draw" = "1" ] && [ -n "$prompt" ] && frame="${frame}${prompt}"$'\n'
             if [ "$CONTAO_SH_HINT_SHOWN" != "1" ]; then
                 frame="${frame}"$'\n'"${C_GREY}(Hoch/runter navigieren, Leertaste/Zifferntaste markiert, rechts/Enter auf \"Fertig\" bestätigt, links = sofort fertig)${C_RESET}"$'\n'
