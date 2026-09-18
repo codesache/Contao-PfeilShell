@@ -545,27 +545,89 @@ contao_check_php() {
 # "composer.phar herunterladen/aktualisieren", um eine vorhandene Datei
 # gezielt durch die aktuelle Version zu ersetzen.
 # ---------------------------------------------------------------------------
-contao_download_composer_phar() {
-    local target_dir="$1" dest
-    dest="$target_dir/composer.phar"
-    echo "Lade aktuelle composer.phar nach $dest herunter ..." >&2
-    if command -v wget >/dev/null 2>&1; then
-        wget -q -O "$dest" https://getcomposer.org/download/latest-stable/composer.phar 2>&2
-    elif command -v curl >/dev/null 2>&1; then
-        curl -fsSL -o "$dest" https://getcomposer.org/download/latest-stable/composer.phar
+# Lädt eine URL nach stdout (fetch_stdout) bzw. in eine Datei (fetch_file).
+# wget und curl sind beide verbreitet, aber selten beide vorhanden.
+_contao_fetch_stdout() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$1" 2>/dev/null
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -O - "$1" 2>/dev/null
     else
-        echo "FEHLER: Weder 'wget' noch 'curl' gefunden - composer.phar kann nicht automatisch heruntergeladen werden." >&2
-        echo "        Bitte manuell laden: https://getcomposer.org/download/" >&2
         return 1
     fi
-    if [ -s "$dest" ]; then
-        chmod +x "$dest" 2>/dev/null
-        echo "composer.phar erfolgreich heruntergeladen." >&2
-        return 0
+}
+
+_contao_fetch_file() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL -o "$2" "$1"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -O "$2" "$1"
+    else
+        return 1
     fi
-    echo "FEHLER: Download von composer.phar fehlgeschlagen." >&2
-    rm -f "$dest" 2>/dev/null
-    return 1
+}
+
+# SHA-256 einer Datei - je nach System steht shasum, sha256sum oder nur
+# openssl zur Verfügung.
+_contao_sha256() {
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" 2>/dev/null | awk '{print $1}'
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "$1" 2>/dev/null | awk '{print $NF}'
+    else
+        return 1
+    fi
+}
+
+contao_download_composer_phar() {
+    local target_dir="$1" dest tmp expected actual
+    dest="$target_dir/composer.phar"
+    tmp="$dest.download.$$"
+    echo "Lade aktuelle composer.phar nach $dest herunter ..." >&2
+
+    if ! _contao_fetch_file "https://getcomposer.org/download/latest-stable/composer.phar" "$tmp"; then
+        echo "FEHLER: Download von composer.phar fehlgeschlagen (weder curl noch wget erfolgreich)." >&2
+        echo "        Bitte manuell laden: https://getcomposer.org/download/" >&2
+        rm -f "$tmp" 2>/dev/null
+        return 1
+    fi
+
+    if [ ! -s "$tmp" ]; then
+        echo "FEHLER: Download von composer.phar fehlgeschlagen (leere Datei)." >&2
+        rm -f "$tmp" 2>/dev/null
+        return 1
+    fi
+
+    # Signatur prüfen: getcomposer.org veröffentlicht zu jedem Build die
+    # SHA-256-Summe. Hier wird ausführbarer Code heruntergeladen, der
+    # anschließend mit den Rechten des aufrufenden Users läuft - ein
+    # abgebrochener oder manipulierter Download darf nicht einfach
+    # chmod +x bekommen.
+    expected="$(_contao_fetch_stdout "https://getcomposer.org/download/latest-stable/composer.phar.sha256sum" | awk '{print $1}')"
+    if [ -z "$expected" ]; then
+        echo "${C_ORANGE}WARNUNG: SHA-256-Prüfsumme von getcomposer.org nicht erreichbar -${C_RESET}" >&2
+        echo "${C_ORANGE}         composer.phar wird ungeprüft übernommen.${C_RESET}" >&2
+    else
+        actual="$(_contao_sha256 "$tmp")"
+        if [ -z "$actual" ]; then
+            echo "${C_ORANGE}WARNUNG: Kein SHA-256-Werkzeug gefunden (shasum/sha256sum/openssl) -${C_RESET}" >&2
+            echo "${C_ORANGE}         composer.phar wird ungeprüft übernommen.${C_RESET}" >&2
+        elif [ "$actual" != "$expected" ]; then
+            echo "FEHLER: Prüfsumme der heruntergeladenen composer.phar stimmt nicht." >&2
+            echo "        erwartet: $expected" >&2
+            echo "        erhalten: $actual" >&2
+            echo "        Datei wird verworfen." >&2
+            rm -f "$tmp" 2>/dev/null
+            return 1
+        fi
+    fi
+
+    mv "$tmp" "$dest" || { rm -f "$tmp" 2>/dev/null; return 1; }
+    chmod +x "$dest" 2>/dev/null
+    echo "composer.phar erfolgreich heruntergeladen${expected:+ (SHA-256 geprüft)}." >&2
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -1378,7 +1440,7 @@ contao_env_set_value() {
     #      Dateisystemgrenzen hinweg (z.B. /tmp -> Projekt) ist es das nicht,
     #      ein Abbruch mittendrin kann eine halbe .env.local hinterlassen.
     #   2. mv uebernimmt die Rechte der Quelldatei. Aus $TMPDIR erbt die
-    #      Zieldatei dadurch die 0600-Rechte von mktemp und ist damit fuer
+    #      Zieldatei dadurch die 0600-Rechte von mktemp und ist damit für
     #      einen abweichenden Webserver-User nicht mehr lesbar.
     dir="$(dirname "$file")"
     tmp="$(mktemp "$dir/.contao-sh-env.XXXXXX")" || return 1
