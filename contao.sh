@@ -384,6 +384,7 @@ if ! contao_resolve_composer "$PROJECT_ROOT"; then
 fi
 
 CONSOLE_CMD=("$PHP_BIN" "$PROJECT_ROOT/vendor/bin/contao-console")
+SETUP_CMD=("$PHP_BIN" "$PROJECT_ROOT/vendor/bin/contao-setup")
 ENV_FILE="$PROJECT_ROOT/$ENV_FILE_REL"
 BACKUP_DIR="$PROJECT_ROOT/$BACKUP_DIR_REL"
 
@@ -453,6 +454,7 @@ contao_refresh_php_dependents() {
     contao_check_php "$REQUIRED_PHP" >/dev/null 2>&1
     contao_resolve_composer "$PROJECT_ROOT"
     CONSOLE_CMD=("$PHP_BIN" "$PROJECT_ROOT/vendor/bin/contao-console")
+    SETUP_CMD=("$PHP_BIN" "$PROJECT_ROOT/vendor/bin/contao-setup")
 }
 
 action_php_select() {
@@ -591,6 +593,40 @@ action_composer_update_all() {
         echo "Abgebrochen."
     fi
     contao_pause
+}
+
+action_composer_install() {
+    if contao_yesno "Composer Install" "composer install ausführen?\n\nInstalliert exakt die in composer.lock festgehaltenen Versionen - der\nübliche Schritt nach git clone/pull oder einem Deployment, im Gegensatz\nzu update, das die Versionen neu auflöst."; then
+        contao_run "composer install" "${COMPOSER_CMD[@]-}" install
+        # vendor/bin/* existiert vor dem ersten install noch nicht - die vom
+        # PHP-Binary abhängigen Kommandos danach neu aufbauen.
+        contao_refresh_php_dependents
+        if contao_yesno "contao-setup" "Im Anschluss vendor/bin/contao-setup ausführen?\n(legt Verzeichnisse an, veröffentlicht Assets, leert den Cache -\nnormalerweise direkt nach einem install fällig)"; then
+            action_contao_setup noprompt
+        fi
+    else
+        echo "Abgebrochen."
+    fi
+    contao_pause
+}
+
+# contao-setup ist der von contao/manager-bundle bereitgestellte
+# Nachbereitungsschritt (contao:setup) - Verzeichnisse, Assets, Symlinks,
+# Cache. Composer ruft ihn bei install/update über ein Script selbst auf;
+# wenn das dort z.B. wegen Speichermangel abgebrochen ist, fehlt er.
+action_contao_setup() {
+    local quiet="${1:-}"
+    if [ ! -f "$PROJECT_ROOT/vendor/bin/contao-setup" ]; then
+        contao_msgbox "contao-setup" "vendor/bin/contao-setup nicht gefunden.\n\nDas Kommando liefert contao/manager-bundle - zuerst composer install\nausführen."
+        [ "$quiet" = "noprompt" ] || contao_pause
+        return 1
+    fi
+    if [ "$quiet" = "noprompt" ] || contao_yesno "contao-setup" "vendor/bin/contao-setup ausführen?\n(legt Verzeichnisse an, veröffentlicht Assets, leert den Cache)"; then
+        contao_run "contao-setup" "${SETUP_CMD[@]-}"
+    else
+        echo "Abgebrochen."
+    fi
+    [ "$quiet" = "noprompt" ] || contao_pause
 }
 
 # ----- Erweiterungen ------------------------------------------------------------
@@ -824,6 +860,61 @@ action_filesync() {
 action_crawl() {
     contao_run "Suchindex aufbauen (crawl)" "${CONSOLE_CMD[@]-}" contao:crawl
     contao_pause
+}
+
+# Contao arbeitet seit 5.x mit Symfony Messenger: Cronjobs und
+# Hintergrundarbeit (Suchindex, Bildbearbeitung, Benachrichtigungen) laufen
+# über Queues. contao:cron ist der Einstiegspunkt, den sonst der Webcron
+# oder ein System-Cron anstößt - hier für den manuellen Anstoß und zum
+# Nachsehen, ob die Queue überhaupt läuft.
+action_cron() {
+    contao_run "Cron ausführen" "${CONSOLE_CMD[@]-}" contao:cron
+    contao_pause
+}
+
+# Fehlgeschlagene Messages landen im Failure-Transport und bleiben dort
+# liegen, bis sie jemand ansieht - ohne Blick in diese Queue fehlt bei
+# "die Mails kommen nicht an"/"der Suchindex aktualisiert nicht" die
+# entscheidende Information.
+action_messenger_menu() {
+    while true; do
+        local choice
+        choice="$(contao_menu "Queue / Messenger" "Projekt: $PROJECT_ROOT" \
+            1 "Fehlgeschlagene Messages anzeigen (messenger:failed:show)" \
+            2 "Fehlgeschlagene Messages erneut verarbeiten (retry)" \
+            3 "Fehlgeschlagene Messages verwerfen (remove, mit Rückfrage)" \
+            4 "Worker einmal laufen lassen (messenger:consume, Zeitlimit 60s)" \
+            0 "Zurück")"
+        [ -z "$choice" ] && break
+        case "$choice" in
+            1) contao_run "messenger:failed:show" "${CONSOLE_CMD[@]-}" messenger:failed:show; contao_pause ;;
+            2) contao_run "messenger:failed:retry" "${CONSOLE_CMD[@]-}" messenger:failed:retry; contao_pause ;;
+            3)
+                local id
+                id="$(contao_inputbox "Messages verwerfen" "ID der zu verwerfenden Message (leer = abbrechen).\nIDs zeigt \"Fehlgeschlagene Messages anzeigen\":" "")"
+                if [ -n "$id" ]; then
+                    if contao_confirm_dangerous "Message $id wird endgültig aus der Failure-Queue entfernt und NICHT mehr verarbeitet."; then
+                        contao_run "messenger:failed:remove $id" "${CONSOLE_CMD[@]-}" messenger:failed:remove "$id" --force
+                    else
+                        echo "Abgebrochen."
+                    fi
+                fi
+                contao_pause
+                ;;
+            4)
+                # Ohne Zeitlimit läuft consume endlos und das Menü kommt nicht
+                # zurück - 60 Sekunden reichen, um zu sehen, ob die Queue
+                # abgearbeitet wird. Ohne Transport-Argument fragt Symfony
+                # selbst nach, welcher Transport konsumiert werden soll -
+                # damit bleibt das unabhängig davon, wie die Transporte in
+                # der jeweiligen Contao-Version heißen.
+                contao_run "messenger:consume (60s)" "${CONSOLE_CMD[@]-}" messenger:consume --time-limit=60
+                contao_pause
+                ;;
+            0) break ;;
+            *) : ;;
+        esac
+    done
 }
 
 action_testmail() {
@@ -1127,29 +1218,33 @@ while true; do
         5  "Composer Version anzeigen" \
         6  "composer.phar herunterladen/aktualisieren" \
         7  "Composer Selfupdate" \
-        8  "Composer Update (mit Memory-Profil)" \
-        9  "Composer Update (Dry-Run / Testlauf)" \
-        10 "Composer Update (alle Pakete aktualisieren)" \
+        8  "Composer Install (Versionen aus composer.lock)" \
+        9  "Composer Update (mit Memory-Profil)" \
+        10 "Composer Update (Dry-Run / Testlauf)" \
+        11 "Composer Update (alle Pakete aktualisieren)" \
+        12 "contao-setup ausführen (Verzeichnisse/Assets/Cache)" \
         "#" "Cache" \
-        11 "Cache leeren" \
-        12 "Cache leeren (prod + dev)" \
+        13 "Cache leeren" \
+        14 "Cache leeren (prod + dev)" \
         "#" "Datenbank + Migration" \
-        13 "Migrate (mit automatischem Backup)" \
-        14 "Migrate ohne Backup" \
-        15 "Cache leeren + Migrate" \
-        16 "Datenbank sichern (contao:backup:create)" \
-        17 "Vorhandene Backups auflisten (contao:backup:list)" \
-        18 "Datenbank aus Backup wiederherstellen (contao:backup:restore)" \
-        19 "Migrate-Debugging (Dry-Run-Varianten)" \
+        15 "Migrate (mit automatischem Backup)" \
+        16 "Migrate ohne Backup" \
+        17 "Cache leeren + Migrate" \
+        18 "Datenbank sichern (contao:backup:create)" \
+        19 "Vorhandene Backups auflisten (contao:backup:list)" \
+        20 "Datenbank aus Backup wiederherstellen (contao:backup:restore)" \
+        21 "Migrate-Debugging (Dry-Run-Varianten)" \
         "#" "Erweiterungen" \
-        20 "Erweiterungen installieren (Checkbox-Auswahl)" \
-        21 "Erweiterungen suchen (Packagist)" \
-        22 "Erweiterungen entfernen (composer remove)" \
+        22 "Erweiterungen installieren (Checkbox-Auswahl)" \
+        23 "Erweiterungen suchen (Packagist)" \
+        24 "Erweiterungen entfernen (composer remove)" \
         "#" "Werkzeuge" \
-        23 "Dateiverwaltung abgleichen (contao:filesync)" \
-        24 "Suchindex aufbauen (contao:crawl)" \
-        25 "Test-E-Mail versenden (mailer:send)" \
-        26 "$ENV_FILE_REL konfigurieren (DATABASE_URL / MAILER_DSN)" \
+        25 "Dateiverwaltung abgleichen (contao:filesync)" \
+        26 "Suchindex aufbauen (contao:crawl)" \
+        27 "Cron ausführen (contao:cron)" \
+        28 "Queue / Messenger (fehlgeschlagene Messages)" \
+        29 "Test-E-Mail versenden (mailer:send)" \
+        30 "$ENV_FILE_REL konfigurieren (DATABASE_URL / MAILER_DSN)" \
         0  "Beenden")"
 
     # Leere/ungültige Eingabe (z.B. ESC bei dialog/whiptail, Tippfehler im
@@ -1165,25 +1260,29 @@ while true; do
         5) action_composer_version ;;
         6) action_composer_phar_download ;;
         7) action_composer_selfupdate ;;
-        8) action_composer_update_profile ;;
-        9) action_composer_update_dryrun ;;
-        10) action_composer_update_all ;;
-        11) action_cache_clear ;;
-        12) action_cache_clear_both ;;
-        13) action_migrate_backup ;;
-        14) action_migrate_nobackup ;;
-        15) action_cache_migrate ;;
-        16) action_backup_create ;;
-        17) action_backup_list ;;
-        18) action_backup_restore ;;
-        19) action_migrate_debug_menu ;;
-        20) action_install_extensions ;;
-        21) action_extensions_search ;;
-        22) action_extensions_remove ;;
-        23) action_filesync ;;
-        24) action_crawl ;;
-        25) action_testmail ;;
-        26) action_env_menu ;;
+        8) action_composer_install ;;
+        9) action_composer_update_profile ;;
+        10) action_composer_update_dryrun ;;
+        11) action_composer_update_all ;;
+        12) action_contao_setup ;;
+        13) action_cache_clear ;;
+        14) action_cache_clear_both ;;
+        15) action_migrate_backup ;;
+        16) action_migrate_nobackup ;;
+        17) action_cache_migrate ;;
+        18) action_backup_create ;;
+        19) action_backup_list ;;
+        20) action_backup_restore ;;
+        21) action_migrate_debug_menu ;;
+        22) action_install_extensions ;;
+        23) action_extensions_search ;;
+        24) action_extensions_remove ;;
+        25) action_filesync ;;
+        26) action_crawl ;;
+        27) action_cron ;;
+        28) action_messenger_menu ;;
+        29) action_testmail ;;
+        30) action_env_menu ;;
         0) break ;;
         *) : ;;
     esac
