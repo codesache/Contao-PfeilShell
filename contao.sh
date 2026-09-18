@@ -855,8 +855,8 @@ action_env_database() {
     local existing
     existing="$(contao_env_get_value "DATABASE_URL" "$ENV_FILE" 2>/dev/null)"
     if [ -n "$existing" ] && [[ "$existing" =~ ^mysql://([^:@/]*):([^@]*)@([^:/]+):([0-9]+)/(.+)$ ]]; then
-        cur_user="${BASH_REMATCH[1]}"
-        cur_pass="${BASH_REMATCH[2]}"
+        cur_user="$(contao_rawurldecode "${BASH_REMATCH[1]}")"
+        cur_pass="$(contao_rawurldecode "${BASH_REMATCH[2]}")"
         cur_host="${BASH_REMATCH[3]}"
         cur_port="${BASH_REMATCH[4]}"
         cur_db="${BASH_REMATCH[5]}"
@@ -878,7 +878,9 @@ action_env_database() {
     pass="$(contao_passwordbox "Datenbank" "Passwort (leer lassen = bisheriges Passwort behalten):")" || { echo "Abgebrochen."; contao_pause; return; }
     [ -z "$pass" ] && pass="$cur_pass"
 
-    local new_url="mysql://${user}:${pass}@${host}:${port}/${dbname}"
+    # User/Passwort prozent-kodiert einsetzen (siehe contao_rawurlencode) -
+    # sonst zerlegt parse_url() eine DSN mit Sonderzeichen im Passwort falsch.
+    local new_url="mysql://$(contao_rawurlencode "$user"):$(contao_rawurlencode "$pass")@${host}:${port}/${dbname}"
     local line="DATABASE_URL=\"$new_url\""
 
     echo ""
@@ -904,8 +906,8 @@ action_env_mailer() {
     local existing
     existing="$(contao_env_get_value "MAILER_DSN" "$ENV_FILE" 2>/dev/null)"
     if [ -n "$existing" ] && [[ "$existing" =~ ^smtp://([^:@/]*):([^@]*)@([^:/?]+):([0-9]+)(\?encryption=([a-zA-Z0-9]+))?$ ]]; then
-        cur_user="${BASH_REMATCH[1]}"
-        cur_pass="${BASH_REMATCH[2]}"
+        cur_user="$(contao_rawurldecode "${BASH_REMATCH[1]}")"
+        cur_pass="$(contao_rawurldecode "${BASH_REMATCH[2]}")"
         cur_host="${BASH_REMATCH[3]}"
         cur_port="${BASH_REMATCH[4]}"
         [ -n "${BASH_REMATCH[6]}" ] && cur_enc="${BASH_REMATCH[6]}"
@@ -938,9 +940,12 @@ action_env_mailer() {
         *) echo "Abgebrochen."; contao_pause; return ;;
     esac
 
-    local new_dsn="smtp://${user}:${pass}@${host}:${port}"
+    local new_dsn="smtp://$(contao_rawurlencode "$user"):$(contao_rawurlencode "$pass")@${host}:${port}"
     [ -n "$enc" ] && new_dsn="${new_dsn}?encryption=${enc}"
-    local line="MAILER_DSN=${new_dsn}"
+    # Wert in Anführungszeichen - eine unquotierte DSN mit # würde von
+    # Symfony/Dotenv ab dem # als Kommentar gelesen (DATABASE_URL unten
+    # macht es bereits so).
+    local line="MAILER_DSN=\"$new_dsn\""
 
     echo ""
     echo "Neue MAILER_DSN: $(contao_env_mask_url "$new_dsn")"

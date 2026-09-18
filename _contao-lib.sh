@@ -1432,6 +1432,21 @@ contao_env_unset_value() {
     mv "$tmp" "$file"
 }
 
+# Prozent-Kodierung für Benutzername/Passwort in einer DSN. Symfony liest
+# DATABASE_URL/MAILER_DSN per parse_url(); ein Passwort mit @ : / ? # oder %
+# zerlegt die URL sonst an der falschen Stelle - der häufigste Fall sind
+# generierte Hoster-Passwörter. PHP statt Bash-Schleife, weil rawurlencode
+# auch Mehrbyte-Zeichen (UTF-8) korrekt behandelt.
+contao_rawurlencode() {
+    [ -z "${1:-}" ] && return 0
+    "$PHP_BIN" -r 'echo rawurlencode($argv[1]);' -- "$1" 2>/dev/null
+}
+
+contao_rawurldecode() {
+    [ -z "${1:-}" ] && return 0
+    "$PHP_BIN" -r 'echo rawurldecode($argv[1]);' -- "$1" 2>/dev/null
+}
+
 # Maskiert das Passwort in einer mysql://... oder smtp://...-URL für die
 # Anzeige (user:PASS@ -> user:***@).
 contao_env_mask_url() {
