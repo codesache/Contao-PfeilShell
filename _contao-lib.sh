@@ -492,7 +492,10 @@ contao_build_status_line() {
     if [ -n "$composer_sig" ] && [ "$composer_sig" = "${CONTAO_SH_COMPOSER_VER_SIG:-}" ] && [ -n "${CONTAO_SH_COMPOSER_VER_CACHE:-}" ]; then
         composer_ver="$CONTAO_SH_COMPOSER_VER_CACHE"
     else
-        composer_ver="$("${COMPOSER_CMD[@]-}" -V 2>/dev/null | sed -E 's/^Composer version ([^ ]+).*/\1/')"
+        # "composer -V" gibt seit Composer 2.x mehrere Zeilen aus (PHP-Version,
+        # Hinweis auf "composer diagnose"). Nur die Versionszeile auswerten -
+        # ein durchreichendes sed hängt den Rest sonst an die Statuszeile an.
+        composer_ver="$("${COMPOSER_CMD[@]-}" -V 2>/dev/null | sed -n -E 's/^Composer version ([^ ]+).*/\1/p' | head -n1)"
         if [ -n "$composer_ver" ] && [ -n "$composer_sig" ] && [ -n "${CONTAO_CONF_FILE:-}" ]; then
             contao_env_set_value "CONTAO_SH_COMPOSER_VER_CACHE" "CONTAO_SH_COMPOSER_VER_CACHE=\"$composer_ver\"" "$CONTAO_CONF_FILE" no_backup
             contao_env_set_value "CONTAO_SH_COMPOSER_VER_SIG" "CONTAO_SH_COMPOSER_VER_SIG=\"$composer_sig\"" "$CONTAO_CONF_FILE" no_backup
@@ -1515,16 +1518,50 @@ contao_env_unset_value() {
 # Prozent-Kodierung für Benutzername/Passwort in einer DSN. Symfony liest
 # DATABASE_URL/MAILER_DSN per parse_url(); ein Passwort mit @ : / ? # oder %
 # zerlegt die URL sonst an der falschen Stelle - der häufigste Fall sind
-# generierte Hoster-Passwörter. PHP statt Bash-Schleife, weil rawurlencode
-# auch Mehrbyte-Zeichen (UTF-8) korrekt behandelt.
+# generierte Hoster-Passwörter.
+#
+# Bewusst in reinem Bash statt über PHP: im DDEV-Betrieb ginge jeder Aufruf
+# sonst durch "ddev exec" (eine halbe Sekunde pro Aufruf), und "ddev exec"
+# schluckt den --Separator, mit dem PHP Skript-Argumente von eigenen Optionen
+# trennt - das Argument käme gar nicht an.
+#
+# LC_ALL=C schaltet die Zeichenkette byteweise: Mehrbyte-Zeichen (UTF-8)
+# werden dadurch Byte für Byte kodiert, genau wie es rawurlencode tut.
 contao_rawurlencode() {
     [ -z "${1:-}" ] && return 0
-    "$PHP_BIN" -r 'echo rawurlencode($argv[1]);' -- "$1" 2>/dev/null
+    local str="$1" out="" i c
+    local LC_ALL=C
+    for (( i=0; i<${#str}; i++ )); do
+        c="${str:i:1}"
+        case "$c" in
+            [a-zA-Z0-9.~_-]) out="$out$c" ;;
+            # Bytes ab 0x80 liefert printf "'$c" als negative Zahl (bash 3.2) -
+            # auf ein Byte maskieren, sonst entsteht %FFFFFFFFFFFFFFC3.
+            *) out="$out$(printf '%%%02X' "$(( $(printf '%d' "'$c") & 0xFF ))")" ;;
+        esac
+    done
+    printf '%s' "$out"
 }
 
 contao_rawurldecode() {
     [ -z "${1:-}" ] && return 0
-    "$PHP_BIN" -r 'echo rawurldecode($argv[1]);' -- "$1" 2>/dev/null
+    local str="$1" out="" i c hex
+    local LC_ALL=C
+    for (( i=0; i<${#str}; i++ )); do
+        c="${str:i:1}"
+        if [ "$c" = "%" ] && [ $((i + 2)) -lt $((${#str} + 1)) ]; then
+            hex="${str:i+1:2}"
+            # Nur echte %XX-Sequenzen auflösen - ein einzelnes % in einem
+            # unkodierten Altbestand bleibt sonst auf der Strecke.
+            if [ ${#hex} -eq 2 ] && [[ "$hex" =~ ^[0-9a-fA-F]{2}$ ]]; then
+                out="$out$(printf '\\x%s' "$hex")"
+                i=$((i + 2))
+                continue
+            fi
+        fi
+        out="$out$c"
+    done
+    printf '%b' "$out"
 }
 
 # Maskiert das Passwort in einer mysql://... oder smtp://...-URL für die
