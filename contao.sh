@@ -153,6 +153,15 @@ if [ -f "$CONTAO_CONF_FILE" ]; then
     source "$CONTAO_CONF_FILE"
 fi
 
+# Composer braucht bei Contao-Projekten regelmäßig mehr Speicher, als das
+# CLI-PHP per php.ini erlaubt (auf Hosting-Umgebungen oft 128/256 MB) - der
+# Abhängigkeitsbaum ist groß genug, dass "Allowed memory size exhausted"
+# mitten im Update der Normalfall ist. Composer wertet dafür
+# COMPOSER_MEMORY_LIMIT aus. Ein in .contao.conf gesetzter eigener Wert
+# bleibt erhalten (z.B. "2G" statt unbegrenzt, wenn der Hoster hart
+# begrenzt und der Prozess sonst vom OOM-Killer beendet wird).
+export COMPOSER_MEMORY_LIMIT="${COMPOSER_MEMORY_LIMIT:--1}"
+
 contao_resolve_php
 
 # Live-Check pro Start: welche PHP-Version ist gerade tatsächlich aktiv,
