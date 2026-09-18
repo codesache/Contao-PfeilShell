@@ -297,6 +297,150 @@ contao_collect_php_candidates() {
 # Version nur unter einem versionierten Namen erreichbar ist.
 PHP_BIN=""
 
+# ---------------------------------------------------------------------------
+# Laufzeitumgebung: Host oder DDEV
+# ---------------------------------------------------------------------------
+# Liegt das Projekt in einem DDEV-Projekt (.ddev/config.yaml) und ist das
+# Skript auf dem Host gestartet, gehören PHP, Composer und die
+# Contao-Console in den Container - nicht auf den Host. Auf einem
+# Entwickler-Mac ist häufig überhaupt kein PHP installiert, und selbst wo
+# eines liegt, ist es nicht das, gegen das das Projekt läuft (andere
+# Version, andere Extensions, kein Zugriff auf die DDEV-Datenbank).
+#
+# Sämtliche PHP-Aufrufe laufen deshalb ueber das Array PHP_CMD statt ueber
+# "$PHP_BIN" - im Host-Betrieb ist das schlicht ("$PHP_BIN"), im
+# DDEV-Betrieb (ddev exec -d <dir> php). "ddev exec" reicht Argumente
+# standardmäßig roh durch (--raw ist Default), Quoting wie bei
+# php -r 'code' bleibt damit erhalten.
+CONTAO_SH_RUNTIME="host"       # "host" oder "ddev"
+CONTAO_SH_DDEV_ROOT=""
+CONTAO_SH_DDEV_NAME=""
+CONTAO_SH_DDEV_PHP=""
+CONTAO_SH_DDEV_DIR=""
+PHP_CMD=()
+
+# Liest einen einfachen Skalar-Wert aus .ddev/config.yaml. Bewusst kein
+# YAML-Parser: gebraucht werden nur Top-Level-Schlüssel wie name,
+# php_version oder docroot.
+_contao_ddev_conf_value() {
+    local key="$1" file="$2"
+    grep -E "^[[:space:]]*${key}:" "$file" 2>/dev/null \
+        | head -n1 \
+        | sed -E "s/^[[:space:]]*${key}:[[:space:]]*//; s/[[:space:]]+#.*$//; s/^[\"']//; s/[\"'][[:space:]]*$//; s/[[:space:]]*$//"
+}
+
+# Sucht .ddev/config.yaml ab dem Startverzeichnis aufwärts.
+contao_find_ddev_root() {
+    local dir="$1"
+    while [ "$dir" != "/" ] && [ -n "$dir" ]; do
+        if [ -f "$dir/.ddev/config.yaml" ]; then
+            echo "$dir"
+            return 0
+        fi
+        dir="$(dirname "$dir")"
+    done
+    return 1
+}
+
+# Erkennt, ob fuer dieses Projekt der DDEV-Betrieb gilt. Nein heißt es in
+# drei Fällen: kein .ddev/config.yaml, per CONTAO_DDEV_MODE="off" in
+# .contao.conf abgeschaltet, oder das Skript läuft bereits IM Container
+# (dort setzt DDEV IS_DDEV_PROJECT; php und composer liegen dann regulaer
+# im PATH und dürfen nicht noch einmal durch ddev geschickt werden).
+contao_detect_ddev() {
+    local start_dir="$1" root conf
+
+    CONTAO_SH_RUNTIME="host"
+    CONTAO_SH_DDEV_ROOT=""
+    CONTAO_SH_DDEV_NAME=""
+    CONTAO_SH_DDEV_PHP=""
+    CONTAO_SH_DDEV_DIR=""
+
+    [ "${CONTAO_DDEV_MODE:-auto}" = "off" ] && return 1
+    [ -n "${IS_DDEV_PROJECT:-}" ] && return 1
+
+    root="$(contao_find_ddev_root "$start_dir")" || return 1
+    conf="$root/.ddev/config.yaml"
+
+    if ! command -v ddev >/dev/null 2>&1; then
+        echo "${C_ORANGE}Hinweis: $root ist ein DDEV-Projekt, aber der Befehl 'ddev' wurde nicht${C_RESET}" >&2
+        echo "${C_ORANGE}         gefunden - es wird mit dem PHP des Hosts weitergearbeitet.${C_RESET}" >&2
+        return 1
+    fi
+
+    CONTAO_SH_DDEV_ROOT="$root"
+    CONTAO_SH_DDEV_NAME="$(_contao_ddev_conf_value name "$conf")"
+    [ -z "$CONTAO_SH_DDEV_NAME" ] && CONTAO_SH_DDEV_NAME="$(basename "$root")"
+    CONTAO_SH_DDEV_PHP="$(_contao_ddev_conf_value php_version "$conf")"
+    CONTAO_SH_RUNTIME="ddev"
+    return 0
+}
+
+# Läuft der Web-Container? "ddev exec true" ist der billigste Test, der
+# wirklich den Container anfasst (ddev describe meldet auch bei paused
+# Projekten noch Daten).
+contao_ddev_running() {
+    [ "$CONTAO_SH_RUNTIME" = "ddev" ] || return 1
+    ddev exec true >/dev/null 2>&1
+}
+
+# Stellt sicher, dass der Container läuft - sonst scheitert jeder
+# nachfolgende Aufruf mit einer Docker-Fehlermeldung, die nicht erklärt,
+# was zu tun ist.
+contao_ddev_ensure_running() {
+    [ "$CONTAO_SH_RUNTIME" = "ddev" ] || return 0
+    contao_ddev_running && return 0
+    if contao_yesno "DDEV starten" "Das DDEV-Projekt \"$CONTAO_SH_DDEV_NAME\" läuft nicht.\n\nJetzt 'ddev start' ausführen?"; then
+        contao_run "ddev start" ddev start && return 0
+        return 1
+    fi
+    echo "Ohne laufenden Container können keine PHP-/Composer-Befehle ausgeführt werden." >&2
+    return 1
+}
+
+# Setzt PHP_CMD (und im DDEV-Betrieb auch COMPOSER_CMD) passend zur
+# erkannten Umgebung. $1 = Verzeichnis, ab dem gesucht wird, $2 (optional) =
+# Projekt-Root, falls schon bekannt - liegt das Projekt in einem
+# Unterverzeichnis des DDEV-Projekts, muss ddev exec dort arbeiten.
+contao_setup_runtime() {
+    local start_dir="$1" project_root="${2:-}" rel
+
+    if contao_detect_ddev "$start_dir"; then
+        rel=""
+        if [ -n "$project_root" ] && [ "$project_root" != "$CONTAO_SH_DDEV_ROOT" ]; then
+            rel="${project_root#"$CONTAO_SH_DDEV_ROOT"}"
+        fi
+        CONTAO_SH_DDEV_DIR="/var/www/html${rel}"
+        PHP_CMD=(ddev exec -d "$CONTAO_SH_DDEV_DIR" php)
+        COMPOSER_CMD=(ddev composer)
+        return 0
+    fi
+
+    PHP_CMD=("$PHP_BIN")
+    return 1
+}
+
+# Baut CONSOLE_CMD/SETUP_CMD passend zur Umgebung. Im DDEV-Betrieb sind die
+# Pfade relativ, weil "ddev exec -d" bereits im Projektverzeichnis des
+# Containers arbeitet - ein Host-Pfad wie /Users/... existiert dort nicht.
+contao_build_console_cmds() {
+    local root="$1"
+    if [ "$CONTAO_SH_RUNTIME" = "ddev" ]; then
+        CONSOLE_CMD=("${PHP_CMD[@]-}" vendor/bin/contao-console)
+        SETUP_CMD=("${PHP_CMD[@]-}" vendor/bin/contao-setup)
+    else
+        CONSOLE_CMD=("$PHP_BIN" "$root/vendor/bin/contao-console")
+        SETUP_CMD=("$PHP_BIN" "$root/vendor/bin/contao-setup")
+    fi
+}
+
+# Ist ein nutzbares PHP vorhanden? Im DDEV-Betrieb entscheidet der
+# Container, nicht ein Pfad auf dem Host.
+contao_php_available() {
+    [ "$CONTAO_SH_RUNTIME" = "ddev" ] && return 0
+    [ -n "${PHP_BIN:-}" ] && [ -x "$PHP_BIN" ]
+}
+
 contao_resolve_php() {
     if [ -n "${PHP_BIN_OVERRIDE:-}" ] && [ -x "$PHP_BIN_OVERRIDE" ]; then
         PHP_BIN="$PHP_BIN_OVERRIDE"
@@ -382,7 +526,7 @@ contao_php_compat_check() {
     CONTAO_SH_PHP_COMPAT_STATUS="unknown"
     CONTAO_SH_PHP_COMPAT_MSG=""
 
-    [ -n "${PHP_BIN:-}" ] && [ -x "$PHP_BIN" ] || return 1
+    contao_php_available || return 1
     branch="$(contao_detect_contao_branch "$dir")" || return 1
     [ -z "$branch" ] && return 1
 
@@ -392,7 +536,7 @@ contao_php_compat_check() {
         e_min="$(echo "$entry" | cut -d'|' -f2)"
         e_max="$(echo "$entry" | cut -d'|' -f3)"
 
-        php_ver="$("$PHP_BIN" -r 'echo PHP_VERSION;' 2>/dev/null)"
+        php_ver="$("${PHP_CMD[@]-}" -r 'echo PHP_VERSION;' 2>/dev/null)"
         [ -z "$php_ver" ] && return 1
         # Vergleich bewusst nur auf Major.Minor-Ebene (Patch-Version
         # ignorieren) - CONTAO_PHP_COMPAT-Einträge sind Branches wie "8.4",
@@ -448,11 +592,11 @@ CONTAO_SH_STATUS_LINE=""
 
 contao_build_status_line() {
     CONTAO_SH_STATUS_LINE=""
-    [ -n "${PHP_BIN:-}" ] && [ -x "$PHP_BIN" ] || return 1
+    contao_php_available || return 1
 
     local php_ver ini_raw mem_limit max_exec max_vars
-    php_ver="$("$PHP_BIN" -r 'echo PHP_VERSION;' 2>/dev/null)"
-    ini_raw="$("$PHP_BIN" -r 'echo ini_get("memory_limit"),"|",ini_get("max_execution_time"),"|",ini_get("max_input_vars");' 2>/dev/null)"
+    php_ver="$("${PHP_CMD[@]-}" -r 'echo PHP_VERSION;' 2>/dev/null)"
+    ini_raw="$("${PHP_CMD[@]-}" -r 'echo ini_get("memory_limit"),"|",ini_get("max_execution_time"),"|",ini_get("max_input_vars");' 2>/dev/null)"
     mem_limit="$(echo "$ini_raw" | cut -d'|' -f1)"
     max_exec="$(echo "$ini_raw" | cut -d'|' -f2)"
     max_vars="$(echo "$ini_raw" | cut -d'|' -f3)"
@@ -485,7 +629,13 @@ contao_build_status_line() {
     # "php -r"-Aufruf (Composer-Bootstrap-Overhead), deshalb nicht bei jedem
     # Start neu ermitteln, sondern nur wenn sich composer.phar geändert hat.
     local composer_ver="" composer_sig="" phar_path
-    if [ -n "${COMPOSER_CMD+x}" ] && [ "${#COMPOSER_CMD[@]}" -ge 2 ]; then
+    if [ "$CONTAO_SH_RUNTIME" = "ddev" ]; then
+        # Im DDEV-Betrieb gibt es keine composer.phar, deren mtime man
+        # beobachten könnte - die Composer-Version hängt am Container.
+        # .ddev/config.yaml ändert sich bei jedem relevanten Umbau
+        # (composer_version, php_version, Image) und taugt als Signatur.
+        [ -f "$CONTAO_SH_DDEV_ROOT/.ddev/config.yaml" ] && composer_sig="ddev-$(date -r "$CONTAO_SH_DDEV_ROOT/.ddev/config.yaml" '+%s' 2>/dev/null)"
+    elif [ -n "${COMPOSER_CMD+x}" ] && [ "${#COMPOSER_CMD[@]}" -ge 2 ]; then
         phar_path="${COMPOSER_CMD[1]}"
         [ -f "$phar_path" ] && composer_sig="$(date -r "$phar_path" '+%s' 2>/dev/null)"
     fi
@@ -504,7 +654,14 @@ contao_build_status_line() {
         fi
     fi
 
-    CONTAO_SH_STATUS_LINE="${php_col} PHP ${php_ver:-?} ${C_RESET}${mem_col} mem ${mem_limit:-?} ${C_RESET}${exec_col} exec ${max_exec:-?}s ${C_RESET}${vars_col} vars ${max_vars:-?} ${C_RESET}${C_BG_GREY} Composer ${composer_ver:-?} ${C_RESET}"
+    # Im DDEV-Betrieb zuerst sichtbar machen, WO die Befehle landen - sonst
+    # liest man die PHP-Version als die des Hosts.
+    local env_seg=""
+    if [ "$CONTAO_SH_RUNTIME" = "ddev" ]; then
+        env_seg="${C_BG_ORANGE} DDEV ${CONTAO_SH_DDEV_NAME:-?} ${C_RESET}"
+    fi
+
+    CONTAO_SH_STATUS_LINE="${env_seg}${php_col} PHP ${php_ver:-?} ${C_RESET}${mem_col} mem ${mem_limit:-?} ${C_RESET}${exec_col} exec ${max_exec:-?}s ${C_RESET}${vars_col} vars ${max_vars:-?} ${C_RESET}${C_BG_GREY} Composer ${composer_ver:-?} ${C_RESET}"
     return 0
 }
 
@@ -517,7 +674,7 @@ contao_build_status_line() {
 contao_check_php() {
     local required="$1"
 
-    if [ -z "$PHP_BIN" ] || [ ! -x "$PHP_BIN" ]; then
+    if ! contao_php_available; then
         echo "FEHLER: Kein PHP gefunden (weder im PATH noch unter den bekannten" >&2
         echo "        MAMP-/Server-Standardpfaden). Bei Bedarf PHP_BIN_OVERRIDE im" >&2
         echo "        Konfig-Block des Scripts auf den vollen Pfad setzen." >&2
@@ -525,14 +682,14 @@ contao_check_php() {
     fi
 
     local version
-    version="$("$PHP_BIN" -r 'echo PHP_VERSION;' 2>/dev/null)"
+    version="$("${PHP_CMD[@]-}" -r 'echo PHP_VERSION;' 2>/dev/null)"
     if [ -z "$version" ]; then
-        echo "FEHLER: PHP-Version konnte nicht ermittelt werden ($PHP_BIN -r fehlgeschlagen)." >&2
+        echo "FEHLER: PHP-Version konnte nicht ermittelt werden (${PHP_CMD[*]-php} -r fehlgeschlagen)." >&2
         return 1
     fi
 
-    if ! "$PHP_BIN" -r "exit(version_compare(PHP_VERSION, '$required', '>=') ? 0 : 1);" 2>/dev/null; then
-        echo "${C_ORANGE}WARNUNG: Gefundene PHP-Version $version ($PHP_BIN) ist niedriger als empfohlen ($required+).${C_RESET}" >&2
+    if ! "${PHP_CMD[@]-}" -r "exit(version_compare(PHP_VERSION, '$required', '>=') ? 0 : 1);" 2>/dev/null; then
+        echo "${C_ORANGE}WARNUNG: Gefundene PHP-Version $version (${PHP_CMD[*]-php}) ist niedriger als empfohlen ($required+).${C_RESET}" >&2
         echo "${C_ORANGE}         Contao 5 benötigt mindestens PHP $required. Ggf. PHP_BIN_OVERRIDE setzen.${C_RESET}" >&2
         return 2
     fi
