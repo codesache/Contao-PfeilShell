@@ -492,7 +492,10 @@ contao_build_status_line() {
     if [ -n "$composer_sig" ] && [ "$composer_sig" = "${CONTAO_SH_COMPOSER_VER_SIG:-}" ] && [ -n "${CONTAO_SH_COMPOSER_VER_CACHE:-}" ]; then
         composer_ver="$CONTAO_SH_COMPOSER_VER_CACHE"
     else
-        composer_ver="$("${COMPOSER_CMD[@]-}" -V 2>/dev/null | sed -E 's/^Composer version ([^ ]+).*/\1/')"
+        # "composer -V" gibt seit Composer 2.x mehrere Zeilen aus (PHP-Version,
+        # Hinweis auf "composer diagnose"). Nur die Versionszeile auswerten -
+        # ein durchreichendes sed hängt den Rest sonst an die Statuszeile an.
+        composer_ver="$("${COMPOSER_CMD[@]-}" -V 2>/dev/null | sed -n -E 's/^Composer version ([^ ]+).*/\1/p' | head -n1)"
         if [ -n "$composer_ver" ] && [ -n "$composer_sig" ] && [ -n "${CONTAO_CONF_FILE:-}" ]; then
             contao_env_set_value "CONTAO_SH_COMPOSER_VER_CACHE" "CONTAO_SH_COMPOSER_VER_CACHE=\"$composer_ver\"" "$CONTAO_CONF_FILE" no_backup
             contao_env_set_value "CONTAO_SH_COMPOSER_VER_SIG" "CONTAO_SH_COMPOSER_VER_SIG=\"$composer_sig\"" "$CONTAO_CONF_FILE" no_backup
@@ -545,27 +548,89 @@ contao_check_php() {
 # "composer.phar herunterladen/aktualisieren", um eine vorhandene Datei
 # gezielt durch die aktuelle Version zu ersetzen.
 # ---------------------------------------------------------------------------
-contao_download_composer_phar() {
-    local target_dir="$1" dest
-    dest="$target_dir/composer.phar"
-    echo "Lade aktuelle composer.phar nach $dest herunter ..." >&2
-    if command -v wget >/dev/null 2>&1; then
-        wget -q -O "$dest" https://getcomposer.org/download/latest-stable/composer.phar 2>&2
-    elif command -v curl >/dev/null 2>&1; then
-        curl -fsSL -o "$dest" https://getcomposer.org/download/latest-stable/composer.phar
+# Lädt eine URL nach stdout (fetch_stdout) bzw. in eine Datei (fetch_file).
+# wget und curl sind beide verbreitet, aber selten beide vorhanden.
+_contao_fetch_stdout() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$1" 2>/dev/null
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -O - "$1" 2>/dev/null
     else
-        echo "FEHLER: Weder 'wget' noch 'curl' gefunden - composer.phar kann nicht automatisch heruntergeladen werden." >&2
-        echo "        Bitte manuell laden: https://getcomposer.org/download/" >&2
         return 1
     fi
-    if [ -s "$dest" ]; then
-        chmod +x "$dest" 2>/dev/null
-        echo "composer.phar erfolgreich heruntergeladen." >&2
-        return 0
+}
+
+_contao_fetch_file() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL -o "$2" "$1"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -O "$2" "$1"
+    else
+        return 1
     fi
-    echo "FEHLER: Download von composer.phar fehlgeschlagen." >&2
-    rm -f "$dest" 2>/dev/null
-    return 1
+}
+
+# SHA-256 einer Datei - je nach System steht shasum, sha256sum oder nur
+# openssl zur Verfügung.
+_contao_sha256() {
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" 2>/dev/null | awk '{print $1}'
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "$1" 2>/dev/null | awk '{print $NF}'
+    else
+        return 1
+    fi
+}
+
+contao_download_composer_phar() {
+    local target_dir="$1" dest tmp expected actual
+    dest="$target_dir/composer.phar"
+    tmp="$dest.download.$$"
+    echo "Lade aktuelle composer.phar nach $dest herunter ..." >&2
+
+    if ! _contao_fetch_file "https://getcomposer.org/download/latest-stable/composer.phar" "$tmp"; then
+        echo "FEHLER: Download von composer.phar fehlgeschlagen (weder curl noch wget erfolgreich)." >&2
+        echo "        Bitte manuell laden: https://getcomposer.org/download/" >&2
+        rm -f "$tmp" 2>/dev/null
+        return 1
+    fi
+
+    if [ ! -s "$tmp" ]; then
+        echo "FEHLER: Download von composer.phar fehlgeschlagen (leere Datei)." >&2
+        rm -f "$tmp" 2>/dev/null
+        return 1
+    fi
+
+    # Signatur prüfen: getcomposer.org veröffentlicht zu jedem Build die
+    # SHA-256-Summe. Hier wird ausführbarer Code heruntergeladen, der
+    # anschließend mit den Rechten des aufrufenden Users läuft - ein
+    # abgebrochener oder manipulierter Download darf nicht einfach
+    # chmod +x bekommen.
+    expected="$(_contao_fetch_stdout "https://getcomposer.org/download/latest-stable/composer.phar.sha256sum" | awk '{print $1}')"
+    if [ -z "$expected" ]; then
+        echo "${C_ORANGE}WARNUNG: SHA-256-Prüfsumme von getcomposer.org nicht erreichbar -${C_RESET}" >&2
+        echo "${C_ORANGE}         composer.phar wird ungeprüft übernommen.${C_RESET}" >&2
+    else
+        actual="$(_contao_sha256 "$tmp")"
+        if [ -z "$actual" ]; then
+            echo "${C_ORANGE}WARNUNG: Kein SHA-256-Werkzeug gefunden (shasum/sha256sum/openssl) -${C_RESET}" >&2
+            echo "${C_ORANGE}         composer.phar wird ungeprüft übernommen.${C_RESET}" >&2
+        elif [ "$actual" != "$expected" ]; then
+            echo "FEHLER: Prüfsumme der heruntergeladenen composer.phar stimmt nicht." >&2
+            echo "        erwartet: $expected" >&2
+            echo "        erhalten: $actual" >&2
+            echo "        Datei wird verworfen." >&2
+            rm -f "$tmp" 2>/dev/null
+            return 1
+        fi
+    fi
+
+    mv "$tmp" "$dest" || { rm -f "$tmp" 2>/dev/null; return 1; }
+    chmod +x "$dest" 2>/dev/null
+    echo "composer.phar erfolgreich heruntergeladen${expected:+ (SHA-256 geprüft)}." >&2
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -726,6 +791,24 @@ contao_pause() {
         IFS= read -n 1 -s -r key
     done
     echo ""
+}
+
+# Löscht ein var/cache/<env>-Verzeichnis des Projekts.
+# Bewusst mit Guard: PROJECT_ROOT ist zwar zum Aufrufzeitpunkt immer gesetzt,
+# ein leerer Wert würde hier aber "rm -rf /var/cache/<env>" bedeuten - das
+# Risiko lohnt die zwei Zeilen Prüfung nicht.
+contao_purge_cache_dir() {
+    local env="$1" dir
+    if [ -z "${PROJECT_ROOT:-}" ] || [ ! -d "$PROJECT_ROOT" ]; then
+        echo "${C_ORANGE}Übersprungen: Projekt-Root unbekannt, var/cache/$env wird nicht gelöscht.${C_RESET}" >&2
+        return 1
+    fi
+    dir="$PROJECT_ROOT/var/cache/$env"
+    [ -d "$dir" ] || return 0
+    echo ""
+    echo "-> rm -rf var/cache/$env"
+    rm -rf "$dir"
+    return 0
 }
 
 # Führt einen Befehl sichtbar aus (Array als Argumente), loggt Erfolg/Fehler.
@@ -1355,15 +1438,41 @@ contao_env_get_value() {
 # neu angelegt. Vor dem Schreiben wird - falls die Datei existiert und $4
 # nicht "no_backup" ist - eine Zeitstempel-Sicherungskopie angelegt. Das
 # Backup ist optional, das Speichern selbst erfolgt in jedem Fall.
+# Liest die Oktal-Rechte einer Datei - BSD/macOS (stat -f) und GNU/Linux
+# (stat -c) unterscheiden sich hier, deshalb beide Varianten probieren.
+_contao_file_mode() {
+    stat -f '%OLp' "$1" 2>/dev/null || stat -c '%a' "$1" 2>/dev/null
+}
+
 contao_env_set_value() {
     local key="$1" line="$2" file="$3" skip_backup="${4:-}"
-    local tmp replaced=0 l
+    local tmp replaced=0 l dir mode backup
 
     if [ -f "$file" ] && [ "$skip_backup" != "no_backup" ]; then
-        cp "$file" "$file.bak-$(date '+%Y%m%d%H%M%S')"
+        backup="$file.bak-$(date '+%Y%m%d%H%M%S')"
+        cp "$file" "$backup"
+        # Backups von .env.local enthalten Klartext-Zugangsdaten - nicht
+        # groesszuegiger schreiben als noetig.
+        chmod 600 "$backup" 2>/dev/null
     fi
 
-    tmp="$(mktemp "${TMPDIR:-/tmp}/contao-sh-env.XXXXXX")"
+    # Temp-Datei bewusst IM Zielverzeichnis anlegen, nicht in $TMPDIR:
+    #   1. mv innerhalb desselben Dateisystems ist atomar - ueber
+    #      Dateisystemgrenzen hinweg (z.B. /tmp -> Projekt) ist es das nicht,
+    #      ein Abbruch mittendrin kann eine halbe .env.local hinterlassen.
+    #   2. mv uebernimmt die Rechte der Quelldatei. Aus $TMPDIR erbt die
+    #      Zieldatei dadurch die 0600-Rechte von mktemp und ist damit für
+    #      einen abweichenden Webserver-User nicht mehr lesbar.
+    dir="$(dirname "$file")"
+    tmp="$(mktemp "$dir/.contao-sh-env.XXXXXX")" || return 1
+
+    if [ -f "$file" ]; then
+        mode="$(_contao_file_mode "$file")"
+        [ -n "$mode" ] && chmod "$mode" "$tmp" 2>/dev/null
+    else
+        # Neu angelegte .env.local enthaelt Zugangsdaten - restriktiv starten.
+        chmod 600 "$tmp" 2>/dev/null
+    fi
     if [ -f "$file" ]; then
         while IFS= read -r l || [ -n "$l" ]; do
             case "$l" in
@@ -1392,8 +1501,11 @@ contao_env_set_value() {
 contao_env_unset_value() {
     local key="$1" file="$2"
     [ -f "$file" ] || return 0
-    local tmp l
-    tmp="$(mktemp "${TMPDIR:-/tmp}/contao-sh-env.XXXXXX")"
+    local tmp l dir mode
+    dir="$(dirname "$file")"
+    tmp="$(mktemp "$dir/.contao-sh-env.XXXXXX")" || return 1
+    mode="$(_contao_file_mode "$file")"
+    [ -n "$mode" ] && chmod "$mode" "$tmp" 2>/dev/null
     while IFS= read -r l || [ -n "$l" ]; do
         case "$l" in
             "${key}="*) ;;
@@ -1401,6 +1513,55 @@ contao_env_unset_value() {
         esac
     done < "$file"
     mv "$tmp" "$file"
+}
+
+# Prozent-Kodierung für Benutzername/Passwort in einer DSN. Symfony liest
+# DATABASE_URL/MAILER_DSN per parse_url(); ein Passwort mit @ : / ? # oder %
+# zerlegt die URL sonst an der falschen Stelle - der häufigste Fall sind
+# generierte Hoster-Passwörter.
+#
+# Bewusst in reinem Bash statt über PHP: im DDEV-Betrieb ginge jeder Aufruf
+# sonst durch "ddev exec" (eine halbe Sekunde pro Aufruf), und "ddev exec"
+# schluckt den --Separator, mit dem PHP Skript-Argumente von eigenen Optionen
+# trennt - das Argument käme gar nicht an.
+#
+# LC_ALL=C schaltet die Zeichenkette byteweise: Mehrbyte-Zeichen (UTF-8)
+# werden dadurch Byte für Byte kodiert, genau wie es rawurlencode tut.
+contao_rawurlencode() {
+    [ -z "${1:-}" ] && return 0
+    local str="$1" out="" i c
+    local LC_ALL=C
+    for (( i=0; i<${#str}; i++ )); do
+        c="${str:i:1}"
+        case "$c" in
+            [a-zA-Z0-9.~_-]) out="$out$c" ;;
+            # Bytes ab 0x80 liefert printf "'$c" als negative Zahl (bash 3.2) -
+            # auf ein Byte maskieren, sonst entsteht %FFFFFFFFFFFFFFC3.
+            *) out="$out$(printf '%%%02X' "$(( $(printf '%d' "'$c") & 0xFF ))")" ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
+contao_rawurldecode() {
+    [ -z "${1:-}" ] && return 0
+    local str="$1" out="" i c hex
+    local LC_ALL=C
+    for (( i=0; i<${#str}; i++ )); do
+        c="${str:i:1}"
+        if [ "$c" = "%" ] && [ $((i + 2)) -lt $((${#str} + 1)) ]; then
+            hex="${str:i+1:2}"
+            # Nur echte %XX-Sequenzen auflösen - ein einzelnes % in einem
+            # unkodierten Altbestand bleibt sonst auf der Strecke.
+            if [ ${#hex} -eq 2 ] && [[ "$hex" =~ ^[0-9a-fA-F]{2}$ ]]; then
+                out="$out$(printf '\\x%s' "$hex")"
+                i=$((i + 2))
+                continue
+            fi
+        fi
+        out="$out$c"
+    done
+    printf '%b' "$out"
 }
 
 # Maskiert das Passwort in einer mysql://... oder smtp://...-URL für die
