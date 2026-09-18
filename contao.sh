@@ -102,7 +102,7 @@ FRESH_INSTALL_VERSIONS=(
 # jeder Änderung an contao.sh/_contao-lib.sh die PATCH-Stelle hochzählen
 # (1.1.0 -> 1.1.1 -> 1.1.2 ...), bei größeren Feature-Sprüngen die
 # MINOR-Stelle.
-CONTAO_SH_VERSION="1.2.0"
+CONTAO_SH_VERSION="1.3.0"
 TOOL_TITLE="Contao PfeilShell - V${CONTAO_SH_VERSION}"
 
 set -u
