@@ -1355,15 +1355,41 @@ contao_env_get_value() {
 # neu angelegt. Vor dem Schreiben wird - falls die Datei existiert und $4
 # nicht "no_backup" ist - eine Zeitstempel-Sicherungskopie angelegt. Das
 # Backup ist optional, das Speichern selbst erfolgt in jedem Fall.
+# Liest die Oktal-Rechte einer Datei - BSD/macOS (stat -f) und GNU/Linux
+# (stat -c) unterscheiden sich hier, deshalb beide Varianten probieren.
+_contao_file_mode() {
+    stat -f '%OLp' "$1" 2>/dev/null || stat -c '%a' "$1" 2>/dev/null
+}
+
 contao_env_set_value() {
     local key="$1" line="$2" file="$3" skip_backup="${4:-}"
-    local tmp replaced=0 l
+    local tmp replaced=0 l dir mode backup
 
     if [ -f "$file" ] && [ "$skip_backup" != "no_backup" ]; then
-        cp "$file" "$file.bak-$(date '+%Y%m%d%H%M%S')"
+        backup="$file.bak-$(date '+%Y%m%d%H%M%S')"
+        cp "$file" "$backup"
+        # Backups von .env.local enthalten Klartext-Zugangsdaten - nicht
+        # groesszuegiger schreiben als noetig.
+        chmod 600 "$backup" 2>/dev/null
     fi
 
-    tmp="$(mktemp "${TMPDIR:-/tmp}/contao-sh-env.XXXXXX")"
+    # Temp-Datei bewusst IM Zielverzeichnis anlegen, nicht in $TMPDIR:
+    #   1. mv innerhalb desselben Dateisystems ist atomar - ueber
+    #      Dateisystemgrenzen hinweg (z.B. /tmp -> Projekt) ist es das nicht,
+    #      ein Abbruch mittendrin kann eine halbe .env.local hinterlassen.
+    #   2. mv uebernimmt die Rechte der Quelldatei. Aus $TMPDIR erbt die
+    #      Zieldatei dadurch die 0600-Rechte von mktemp und ist damit fuer
+    #      einen abweichenden Webserver-User nicht mehr lesbar.
+    dir="$(dirname "$file")"
+    tmp="$(mktemp "$dir/.contao-sh-env.XXXXXX")" || return 1
+
+    if [ -f "$file" ]; then
+        mode="$(_contao_file_mode "$file")"
+        [ -n "$mode" ] && chmod "$mode" "$tmp" 2>/dev/null
+    else
+        # Neu angelegte .env.local enthaelt Zugangsdaten - restriktiv starten.
+        chmod 600 "$tmp" 2>/dev/null
+    fi
     if [ -f "$file" ]; then
         while IFS= read -r l || [ -n "$l" ]; do
             case "$l" in
@@ -1392,8 +1418,11 @@ contao_env_set_value() {
 contao_env_unset_value() {
     local key="$1" file="$2"
     [ -f "$file" ] || return 0
-    local tmp l
-    tmp="$(mktemp "${TMPDIR:-/tmp}/contao-sh-env.XXXXXX")"
+    local tmp l dir mode
+    dir="$(dirname "$file")"
+    tmp="$(mktemp "$dir/.contao-sh-env.XXXXXX")" || return 1
+    mode="$(_contao_file_mode "$file")"
+    [ -n "$mode" ] && chmod "$mode" "$tmp" 2>/dev/null
     while IFS= read -r l || [ -n "$l" ]; do
         case "$l" in
             "${key}="*) ;;
