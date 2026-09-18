@@ -297,6 +297,150 @@ contao_collect_php_candidates() {
 # Version nur unter einem versionierten Namen erreichbar ist.
 PHP_BIN=""
 
+# ---------------------------------------------------------------------------
+# Laufzeitumgebung: Host oder DDEV
+# ---------------------------------------------------------------------------
+# Liegt das Projekt in einem DDEV-Projekt (.ddev/config.yaml) und ist das
+# Skript auf dem Host gestartet, gehören PHP, Composer und die
+# Contao-Console in den Container - nicht auf den Host. Auf einem
+# Entwickler-Mac ist häufig überhaupt kein PHP installiert, und selbst wo
+# eines liegt, ist es nicht das, gegen das das Projekt läuft (andere
+# Version, andere Extensions, kein Zugriff auf die DDEV-Datenbank).
+#
+# Sämtliche PHP-Aufrufe laufen deshalb ueber das Array PHP_CMD statt ueber
+# "$PHP_BIN" - im Host-Betrieb ist das schlicht ("$PHP_BIN"), im
+# DDEV-Betrieb (ddev exec -d <dir> php). "ddev exec" reicht Argumente
+# standardmäßig roh durch (--raw ist Default), Quoting wie bei
+# php -r 'code' bleibt damit erhalten.
+CONTAO_SH_RUNTIME="host"       # "host" oder "ddev"
+CONTAO_SH_DDEV_ROOT=""
+CONTAO_SH_DDEV_NAME=""
+CONTAO_SH_DDEV_PHP=""
+CONTAO_SH_DDEV_DIR=""
+PHP_CMD=()
+
+# Liest einen einfachen Skalar-Wert aus .ddev/config.yaml. Bewusst kein
+# YAML-Parser: gebraucht werden nur Top-Level-Schlüssel wie name,
+# php_version oder docroot.
+_contao_ddev_conf_value() {
+    local key="$1" file="$2"
+    grep -E "^[[:space:]]*${key}:" "$file" 2>/dev/null \
+        | head -n1 \
+        | sed -E "s/^[[:space:]]*${key}:[[:space:]]*//; s/[[:space:]]+#.*$//; s/^[\"']//; s/[\"'][[:space:]]*$//; s/[[:space:]]*$//"
+}
+
+# Sucht .ddev/config.yaml ab dem Startverzeichnis aufwärts.
+contao_find_ddev_root() {
+    local dir="$1"
+    while [ "$dir" != "/" ] && [ -n "$dir" ]; do
+        if [ -f "$dir/.ddev/config.yaml" ]; then
+            echo "$dir"
+            return 0
+        fi
+        dir="$(dirname "$dir")"
+    done
+    return 1
+}
+
+# Erkennt, ob fuer dieses Projekt der DDEV-Betrieb gilt. Nein heißt es in
+# drei Fällen: kein .ddev/config.yaml, per CONTAO_DDEV_MODE="off" in
+# .contao.conf abgeschaltet, oder das Skript läuft bereits IM Container
+# (dort setzt DDEV IS_DDEV_PROJECT; php und composer liegen dann regulaer
+# im PATH und dürfen nicht noch einmal durch ddev geschickt werden).
+contao_detect_ddev() {
+    local start_dir="$1" root conf
+
+    CONTAO_SH_RUNTIME="host"
+    CONTAO_SH_DDEV_ROOT=""
+    CONTAO_SH_DDEV_NAME=""
+    CONTAO_SH_DDEV_PHP=""
+    CONTAO_SH_DDEV_DIR=""
+
+    [ "${CONTAO_DDEV_MODE:-auto}" = "off" ] && return 1
+    [ -n "${IS_DDEV_PROJECT:-}" ] && return 1
+
+    root="$(contao_find_ddev_root "$start_dir")" || return 1
+    conf="$root/.ddev/config.yaml"
+
+    if ! command -v ddev >/dev/null 2>&1; then
+        echo "${C_ORANGE}Hinweis: $root ist ein DDEV-Projekt, aber der Befehl 'ddev' wurde nicht${C_RESET}" >&2
+        echo "${C_ORANGE}         gefunden - es wird mit dem PHP des Hosts weitergearbeitet.${C_RESET}" >&2
+        return 1
+    fi
+
+    CONTAO_SH_DDEV_ROOT="$root"
+    CONTAO_SH_DDEV_NAME="$(_contao_ddev_conf_value name "$conf")"
+    [ -z "$CONTAO_SH_DDEV_NAME" ] && CONTAO_SH_DDEV_NAME="$(basename "$root")"
+    CONTAO_SH_DDEV_PHP="$(_contao_ddev_conf_value php_version "$conf")"
+    CONTAO_SH_RUNTIME="ddev"
+    return 0
+}
+
+# Läuft der Web-Container? "ddev exec true" ist der billigste Test, der
+# wirklich den Container anfasst (ddev describe meldet auch bei paused
+# Projekten noch Daten).
+contao_ddev_running() {
+    [ "$CONTAO_SH_RUNTIME" = "ddev" ] || return 1
+    ddev exec true >/dev/null 2>&1
+}
+
+# Stellt sicher, dass der Container läuft - sonst scheitert jeder
+# nachfolgende Aufruf mit einer Docker-Fehlermeldung, die nicht erklärt,
+# was zu tun ist.
+contao_ddev_ensure_running() {
+    [ "$CONTAO_SH_RUNTIME" = "ddev" ] || return 0
+    contao_ddev_running && return 0
+    if contao_yesno "DDEV starten" "Das DDEV-Projekt \"$CONTAO_SH_DDEV_NAME\" läuft nicht.\n\nJetzt 'ddev start' ausführen?"; then
+        contao_run "ddev start" ddev start && return 0
+        return 1
+    fi
+    echo "Ohne laufenden Container können keine PHP-/Composer-Befehle ausgeführt werden." >&2
+    return 1
+}
+
+# Setzt PHP_CMD (und im DDEV-Betrieb auch COMPOSER_CMD) passend zur
+# erkannten Umgebung. $1 = Verzeichnis, ab dem gesucht wird, $2 (optional) =
+# Projekt-Root, falls schon bekannt - liegt das Projekt in einem
+# Unterverzeichnis des DDEV-Projekts, muss ddev exec dort arbeiten.
+contao_setup_runtime() {
+    local start_dir="$1" project_root="${2:-}" rel
+
+    if contao_detect_ddev "$start_dir"; then
+        rel=""
+        if [ -n "$project_root" ] && [ "$project_root" != "$CONTAO_SH_DDEV_ROOT" ]; then
+            rel="${project_root#"$CONTAO_SH_DDEV_ROOT"}"
+        fi
+        CONTAO_SH_DDEV_DIR="/var/www/html${rel}"
+        PHP_CMD=(ddev exec -d "$CONTAO_SH_DDEV_DIR" php)
+        COMPOSER_CMD=(ddev composer)
+        return 0
+    fi
+
+    PHP_CMD=("$PHP_BIN")
+    return 1
+}
+
+# Baut CONSOLE_CMD/SETUP_CMD passend zur Umgebung. Im DDEV-Betrieb sind die
+# Pfade relativ, weil "ddev exec -d" bereits im Projektverzeichnis des
+# Containers arbeitet - ein Host-Pfad wie /Users/... existiert dort nicht.
+contao_build_console_cmds() {
+    local root="$1"
+    if [ "$CONTAO_SH_RUNTIME" = "ddev" ]; then
+        CONSOLE_CMD=("${PHP_CMD[@]-}" vendor/bin/contao-console)
+        SETUP_CMD=("${PHP_CMD[@]-}" vendor/bin/contao-setup)
+    else
+        CONSOLE_CMD=("$PHP_BIN" "$root/vendor/bin/contao-console")
+        SETUP_CMD=("$PHP_BIN" "$root/vendor/bin/contao-setup")
+    fi
+}
+
+# Ist ein nutzbares PHP vorhanden? Im DDEV-Betrieb entscheidet der
+# Container, nicht ein Pfad auf dem Host.
+contao_php_available() {
+    [ "$CONTAO_SH_RUNTIME" = "ddev" ] && return 0
+    [ -n "${PHP_BIN:-}" ] && [ -x "$PHP_BIN" ]
+}
+
 contao_resolve_php() {
     if [ -n "${PHP_BIN_OVERRIDE:-}" ] && [ -x "$PHP_BIN_OVERRIDE" ]; then
         PHP_BIN="$PHP_BIN_OVERRIDE"
@@ -382,7 +526,7 @@ contao_php_compat_check() {
     CONTAO_SH_PHP_COMPAT_STATUS="unknown"
     CONTAO_SH_PHP_COMPAT_MSG=""
 
-    [ -n "${PHP_BIN:-}" ] && [ -x "$PHP_BIN" ] || return 1
+    contao_php_available || return 1
     branch="$(contao_detect_contao_branch "$dir")" || return 1
     [ -z "$branch" ] && return 1
 
@@ -392,7 +536,7 @@ contao_php_compat_check() {
         e_min="$(echo "$entry" | cut -d'|' -f2)"
         e_max="$(echo "$entry" | cut -d'|' -f3)"
 
-        php_ver="$("$PHP_BIN" -r 'echo PHP_VERSION;' 2>/dev/null)"
+        php_ver="$("${PHP_CMD[@]-}" -r 'echo PHP_VERSION;' 2>/dev/null)"
         [ -z "$php_ver" ] && return 1
         # Vergleich bewusst nur auf Major.Minor-Ebene (Patch-Version
         # ignorieren) - CONTAO_PHP_COMPAT-Einträge sind Branches wie "8.4",
@@ -448,11 +592,11 @@ CONTAO_SH_STATUS_LINE=""
 
 contao_build_status_line() {
     CONTAO_SH_STATUS_LINE=""
-    [ -n "${PHP_BIN:-}" ] && [ -x "$PHP_BIN" ] || return 1
+    contao_php_available || return 1
 
     local php_ver ini_raw mem_limit max_exec max_vars
-    php_ver="$("$PHP_BIN" -r 'echo PHP_VERSION;' 2>/dev/null)"
-    ini_raw="$("$PHP_BIN" -r 'echo ini_get("memory_limit"),"|",ini_get("max_execution_time"),"|",ini_get("max_input_vars");' 2>/dev/null)"
+    php_ver="$("${PHP_CMD[@]-}" -r 'echo PHP_VERSION;' 2>/dev/null)"
+    ini_raw="$("${PHP_CMD[@]-}" -r 'echo ini_get("memory_limit"),"|",ini_get("max_execution_time"),"|",ini_get("max_input_vars");' 2>/dev/null)"
     mem_limit="$(echo "$ini_raw" | cut -d'|' -f1)"
     max_exec="$(echo "$ini_raw" | cut -d'|' -f2)"
     max_vars="$(echo "$ini_raw" | cut -d'|' -f3)"
@@ -485,14 +629,23 @@ contao_build_status_line() {
     # "php -r"-Aufruf (Composer-Bootstrap-Overhead), deshalb nicht bei jedem
     # Start neu ermitteln, sondern nur wenn sich composer.phar geändert hat.
     local composer_ver="" composer_sig="" phar_path
-    if [ -n "${COMPOSER_CMD+x}" ] && [ "${#COMPOSER_CMD[@]}" -ge 2 ]; then
+    if [ "$CONTAO_SH_RUNTIME" = "ddev" ]; then
+        # Im DDEV-Betrieb gibt es keine composer.phar, deren mtime man
+        # beobachten könnte - die Composer-Version hängt am Container.
+        # .ddev/config.yaml ändert sich bei jedem relevanten Umbau
+        # (composer_version, php_version, Image) und taugt als Signatur.
+        [ -f "$CONTAO_SH_DDEV_ROOT/.ddev/config.yaml" ] && composer_sig="ddev-$(date -r "$CONTAO_SH_DDEV_ROOT/.ddev/config.yaml" '+%s' 2>/dev/null)"
+    elif [ -n "${COMPOSER_CMD+x}" ] && [ "${#COMPOSER_CMD[@]}" -ge 2 ]; then
         phar_path="${COMPOSER_CMD[1]}"
         [ -f "$phar_path" ] && composer_sig="$(date -r "$phar_path" '+%s' 2>/dev/null)"
     fi
     if [ -n "$composer_sig" ] && [ "$composer_sig" = "${CONTAO_SH_COMPOSER_VER_SIG:-}" ] && [ -n "${CONTAO_SH_COMPOSER_VER_CACHE:-}" ]; then
         composer_ver="$CONTAO_SH_COMPOSER_VER_CACHE"
     else
-        composer_ver="$("${COMPOSER_CMD[@]-}" -V 2>/dev/null | sed -E 's/^Composer version ([^ ]+).*/\1/')"
+        # "composer -V" gibt seit Composer 2.x mehrere Zeilen aus (PHP-Version,
+        # Hinweis auf "composer diagnose"). Nur die Versionszeile auswerten -
+        # ein durchreichendes sed hängt den Rest sonst an die Statuszeile an.
+        composer_ver="$("${COMPOSER_CMD[@]-}" -V 2>/dev/null | sed -n -E 's/^Composer version ([^ ]+).*/\1/p' | head -n1)"
         if [ -n "$composer_ver" ] && [ -n "$composer_sig" ] && [ -n "${CONTAO_CONF_FILE:-}" ]; then
             contao_env_set_value "CONTAO_SH_COMPOSER_VER_CACHE" "CONTAO_SH_COMPOSER_VER_CACHE=\"$composer_ver\"" "$CONTAO_CONF_FILE" no_backup
             contao_env_set_value "CONTAO_SH_COMPOSER_VER_SIG" "CONTAO_SH_COMPOSER_VER_SIG=\"$composer_sig\"" "$CONTAO_CONF_FILE" no_backup
@@ -501,7 +654,14 @@ contao_build_status_line() {
         fi
     fi
 
-    CONTAO_SH_STATUS_LINE="${php_col} PHP ${php_ver:-?} ${C_RESET}${mem_col} mem ${mem_limit:-?} ${C_RESET}${exec_col} exec ${max_exec:-?}s ${C_RESET}${vars_col} vars ${max_vars:-?} ${C_RESET}${C_BG_GREY} Composer ${composer_ver:-?} ${C_RESET}"
+    # Im DDEV-Betrieb zuerst sichtbar machen, WO die Befehle landen - sonst
+    # liest man die PHP-Version als die des Hosts.
+    local env_seg=""
+    if [ "$CONTAO_SH_RUNTIME" = "ddev" ]; then
+        env_seg="${C_BG_ORANGE} DDEV ${CONTAO_SH_DDEV_NAME:-?} ${C_RESET}"
+    fi
+
+    CONTAO_SH_STATUS_LINE="${env_seg}${php_col} PHP ${php_ver:-?} ${C_RESET}${mem_col} mem ${mem_limit:-?} ${C_RESET}${exec_col} exec ${max_exec:-?}s ${C_RESET}${vars_col} vars ${max_vars:-?} ${C_RESET}${C_BG_GREY} Composer ${composer_ver:-?} ${C_RESET}"
     return 0
 }
 
@@ -514,7 +674,7 @@ contao_build_status_line() {
 contao_check_php() {
     local required="$1"
 
-    if [ -z "$PHP_BIN" ] || [ ! -x "$PHP_BIN" ]; then
+    if ! contao_php_available; then
         echo "FEHLER: Kein PHP gefunden (weder im PATH noch unter den bekannten" >&2
         echo "        MAMP-/Server-Standardpfaden). Bei Bedarf PHP_BIN_OVERRIDE im" >&2
         echo "        Konfig-Block des Scripts auf den vollen Pfad setzen." >&2
@@ -522,14 +682,14 @@ contao_check_php() {
     fi
 
     local version
-    version="$("$PHP_BIN" -r 'echo PHP_VERSION;' 2>/dev/null)"
+    version="$("${PHP_CMD[@]-}" -r 'echo PHP_VERSION;' 2>/dev/null)"
     if [ -z "$version" ]; then
-        echo "FEHLER: PHP-Version konnte nicht ermittelt werden ($PHP_BIN -r fehlgeschlagen)." >&2
+        echo "FEHLER: PHP-Version konnte nicht ermittelt werden (${PHP_CMD[*]-php} -r fehlgeschlagen)." >&2
         return 1
     fi
 
-    if ! "$PHP_BIN" -r "exit(version_compare(PHP_VERSION, '$required', '>=') ? 0 : 1);" 2>/dev/null; then
-        echo "${C_ORANGE}WARNUNG: Gefundene PHP-Version $version ($PHP_BIN) ist niedriger als empfohlen ($required+).${C_RESET}" >&2
+    if ! "${PHP_CMD[@]-}" -r "exit(version_compare(PHP_VERSION, '$required', '>=') ? 0 : 1);" 2>/dev/null; then
+        echo "${C_ORANGE}WARNUNG: Gefundene PHP-Version $version (${PHP_CMD[*]-php}) ist niedriger als empfohlen ($required+).${C_RESET}" >&2
         echo "${C_ORANGE}         Contao 5 benötigt mindestens PHP $required. Ggf. PHP_BIN_OVERRIDE setzen.${C_RESET}" >&2
         return 2
     fi
@@ -545,27 +705,89 @@ contao_check_php() {
 # "composer.phar herunterladen/aktualisieren", um eine vorhandene Datei
 # gezielt durch die aktuelle Version zu ersetzen.
 # ---------------------------------------------------------------------------
-contao_download_composer_phar() {
-    local target_dir="$1" dest
-    dest="$target_dir/composer.phar"
-    echo "Lade aktuelle composer.phar nach $dest herunter ..." >&2
-    if command -v wget >/dev/null 2>&1; then
-        wget -q -O "$dest" https://getcomposer.org/download/latest-stable/composer.phar 2>&2
-    elif command -v curl >/dev/null 2>&1; then
-        curl -fsSL -o "$dest" https://getcomposer.org/download/latest-stable/composer.phar
+# Lädt eine URL nach stdout (fetch_stdout) bzw. in eine Datei (fetch_file).
+# wget und curl sind beide verbreitet, aber selten beide vorhanden.
+_contao_fetch_stdout() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$1" 2>/dev/null
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -O - "$1" 2>/dev/null
     else
-        echo "FEHLER: Weder 'wget' noch 'curl' gefunden - composer.phar kann nicht automatisch heruntergeladen werden." >&2
-        echo "        Bitte manuell laden: https://getcomposer.org/download/" >&2
         return 1
     fi
-    if [ -s "$dest" ]; then
-        chmod +x "$dest" 2>/dev/null
-        echo "composer.phar erfolgreich heruntergeladen." >&2
-        return 0
+}
+
+_contao_fetch_file() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL -o "$2" "$1"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -O "$2" "$1"
+    else
+        return 1
     fi
-    echo "FEHLER: Download von composer.phar fehlgeschlagen." >&2
-    rm -f "$dest" 2>/dev/null
-    return 1
+}
+
+# SHA-256 einer Datei - je nach System steht shasum, sha256sum oder nur
+# openssl zur Verfügung.
+_contao_sha256() {
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" 2>/dev/null | awk '{print $1}'
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "$1" 2>/dev/null | awk '{print $NF}'
+    else
+        return 1
+    fi
+}
+
+contao_download_composer_phar() {
+    local target_dir="$1" dest tmp expected actual
+    dest="$target_dir/composer.phar"
+    tmp="$dest.download.$$"
+    echo "Lade aktuelle composer.phar nach $dest herunter ..." >&2
+
+    if ! _contao_fetch_file "https://getcomposer.org/download/latest-stable/composer.phar" "$tmp"; then
+        echo "FEHLER: Download von composer.phar fehlgeschlagen (weder curl noch wget erfolgreich)." >&2
+        echo "        Bitte manuell laden: https://getcomposer.org/download/" >&2
+        rm -f "$tmp" 2>/dev/null
+        return 1
+    fi
+
+    if [ ! -s "$tmp" ]; then
+        echo "FEHLER: Download von composer.phar fehlgeschlagen (leere Datei)." >&2
+        rm -f "$tmp" 2>/dev/null
+        return 1
+    fi
+
+    # Signatur prüfen: getcomposer.org veröffentlicht zu jedem Build die
+    # SHA-256-Summe. Hier wird ausführbarer Code heruntergeladen, der
+    # anschließend mit den Rechten des aufrufenden Users läuft - ein
+    # abgebrochener oder manipulierter Download darf nicht einfach
+    # chmod +x bekommen.
+    expected="$(_contao_fetch_stdout "https://getcomposer.org/download/latest-stable/composer.phar.sha256sum" | awk '{print $1}')"
+    if [ -z "$expected" ]; then
+        echo "${C_ORANGE}WARNUNG: SHA-256-Prüfsumme von getcomposer.org nicht erreichbar -${C_RESET}" >&2
+        echo "${C_ORANGE}         composer.phar wird ungeprüft übernommen.${C_RESET}" >&2
+    else
+        actual="$(_contao_sha256 "$tmp")"
+        if [ -z "$actual" ]; then
+            echo "${C_ORANGE}WARNUNG: Kein SHA-256-Werkzeug gefunden (shasum/sha256sum/openssl) -${C_RESET}" >&2
+            echo "${C_ORANGE}         composer.phar wird ungeprüft übernommen.${C_RESET}" >&2
+        elif [ "$actual" != "$expected" ]; then
+            echo "FEHLER: Prüfsumme der heruntergeladenen composer.phar stimmt nicht." >&2
+            echo "        erwartet: $expected" >&2
+            echo "        erhalten: $actual" >&2
+            echo "        Datei wird verworfen." >&2
+            rm -f "$tmp" 2>/dev/null
+            return 1
+        fi
+    fi
+
+    mv "$tmp" "$dest" || { rm -f "$tmp" 2>/dev/null; return 1; }
+    chmod +x "$dest" 2>/dev/null
+    echo "composer.phar erfolgreich heruntergeladen${expected:+ (SHA-256 geprüft)}." >&2
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -726,6 +948,24 @@ contao_pause() {
         IFS= read -n 1 -s -r key
     done
     echo ""
+}
+
+# Löscht ein var/cache/<env>-Verzeichnis des Projekts.
+# Bewusst mit Guard: PROJECT_ROOT ist zwar zum Aufrufzeitpunkt immer gesetzt,
+# ein leerer Wert würde hier aber "rm -rf /var/cache/<env>" bedeuten - das
+# Risiko lohnt die zwei Zeilen Prüfung nicht.
+contao_purge_cache_dir() {
+    local env="$1" dir
+    if [ -z "${PROJECT_ROOT:-}" ] || [ ! -d "$PROJECT_ROOT" ]; then
+        echo "${C_ORANGE}Übersprungen: Projekt-Root unbekannt, var/cache/$env wird nicht gelöscht.${C_RESET}" >&2
+        return 1
+    fi
+    dir="$PROJECT_ROOT/var/cache/$env"
+    [ -d "$dir" ] || return 0
+    echo ""
+    echo "-> rm -rf var/cache/$env"
+    rm -rf "$dir"
+    return 0
 }
 
 # Führt einen Befehl sichtbar aus (Array als Argumente), loggt Erfolg/Fehler.
@@ -1355,15 +1595,41 @@ contao_env_get_value() {
 # neu angelegt. Vor dem Schreiben wird - falls die Datei existiert und $4
 # nicht "no_backup" ist - eine Zeitstempel-Sicherungskopie angelegt. Das
 # Backup ist optional, das Speichern selbst erfolgt in jedem Fall.
+# Liest die Oktal-Rechte einer Datei - BSD/macOS (stat -f) und GNU/Linux
+# (stat -c) unterscheiden sich hier, deshalb beide Varianten probieren.
+_contao_file_mode() {
+    stat -f '%OLp' "$1" 2>/dev/null || stat -c '%a' "$1" 2>/dev/null
+}
+
 contao_env_set_value() {
     local key="$1" line="$2" file="$3" skip_backup="${4:-}"
-    local tmp replaced=0 l
+    local tmp replaced=0 l dir mode backup
 
     if [ -f "$file" ] && [ "$skip_backup" != "no_backup" ]; then
-        cp "$file" "$file.bak-$(date '+%Y%m%d%H%M%S')"
+        backup="$file.bak-$(date '+%Y%m%d%H%M%S')"
+        cp "$file" "$backup"
+        # Backups von .env.local enthalten Klartext-Zugangsdaten - nicht
+        # groesszuegiger schreiben als noetig.
+        chmod 600 "$backup" 2>/dev/null
     fi
 
-    tmp="$(mktemp "${TMPDIR:-/tmp}/contao-sh-env.XXXXXX")"
+    # Temp-Datei bewusst IM Zielverzeichnis anlegen, nicht in $TMPDIR:
+    #   1. mv innerhalb desselben Dateisystems ist atomar - ueber
+    #      Dateisystemgrenzen hinweg (z.B. /tmp -> Projekt) ist es das nicht,
+    #      ein Abbruch mittendrin kann eine halbe .env.local hinterlassen.
+    #   2. mv uebernimmt die Rechte der Quelldatei. Aus $TMPDIR erbt die
+    #      Zieldatei dadurch die 0600-Rechte von mktemp und ist damit für
+    #      einen abweichenden Webserver-User nicht mehr lesbar.
+    dir="$(dirname "$file")"
+    tmp="$(mktemp "$dir/.contao-sh-env.XXXXXX")" || return 1
+
+    if [ -f "$file" ]; then
+        mode="$(_contao_file_mode "$file")"
+        [ -n "$mode" ] && chmod "$mode" "$tmp" 2>/dev/null
+    else
+        # Neu angelegte .env.local enthaelt Zugangsdaten - restriktiv starten.
+        chmod 600 "$tmp" 2>/dev/null
+    fi
     if [ -f "$file" ]; then
         while IFS= read -r l || [ -n "$l" ]; do
             case "$l" in
@@ -1392,8 +1658,11 @@ contao_env_set_value() {
 contao_env_unset_value() {
     local key="$1" file="$2"
     [ -f "$file" ] || return 0
-    local tmp l
-    tmp="$(mktemp "${TMPDIR:-/tmp}/contao-sh-env.XXXXXX")"
+    local tmp l dir mode
+    dir="$(dirname "$file")"
+    tmp="$(mktemp "$dir/.contao-sh-env.XXXXXX")" || return 1
+    mode="$(_contao_file_mode "$file")"
+    [ -n "$mode" ] && chmod "$mode" "$tmp" 2>/dev/null
     while IFS= read -r l || [ -n "$l" ]; do
         case "$l" in
             "${key}="*) ;;
@@ -1401,6 +1670,55 @@ contao_env_unset_value() {
         esac
     done < "$file"
     mv "$tmp" "$file"
+}
+
+# Prozent-Kodierung für Benutzername/Passwort in einer DSN. Symfony liest
+# DATABASE_URL/MAILER_DSN per parse_url(); ein Passwort mit @ : / ? # oder %
+# zerlegt die URL sonst an der falschen Stelle - der häufigste Fall sind
+# generierte Hoster-Passwörter.
+#
+# Bewusst in reinem Bash statt über PHP: im DDEV-Betrieb ginge jeder Aufruf
+# sonst durch "ddev exec" (eine halbe Sekunde pro Aufruf), und "ddev exec"
+# schluckt den --Separator, mit dem PHP Skript-Argumente von eigenen Optionen
+# trennt - das Argument käme gar nicht an.
+#
+# LC_ALL=C schaltet die Zeichenkette byteweise: Mehrbyte-Zeichen (UTF-8)
+# werden dadurch Byte für Byte kodiert, genau wie es rawurlencode tut.
+contao_rawurlencode() {
+    [ -z "${1:-}" ] && return 0
+    local str="$1" out="" i c
+    local LC_ALL=C
+    for (( i=0; i<${#str}; i++ )); do
+        c="${str:i:1}"
+        case "$c" in
+            [a-zA-Z0-9.~_-]) out="$out$c" ;;
+            # Bytes ab 0x80 liefert printf "'$c" als negative Zahl (bash 3.2) -
+            # auf ein Byte maskieren, sonst entsteht %FFFFFFFFFFFFFFC3.
+            *) out="$out$(printf '%%%02X' "$(( $(printf '%d' "'$c") & 0xFF ))")" ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
+contao_rawurldecode() {
+    [ -z "${1:-}" ] && return 0
+    local str="$1" out="" i c hex
+    local LC_ALL=C
+    for (( i=0; i<${#str}; i++ )); do
+        c="${str:i:1}"
+        if [ "$c" = "%" ] && [ $((i + 2)) -lt $((${#str} + 1)) ]; then
+            hex="${str:i+1:2}"
+            # Nur echte %XX-Sequenzen auflösen - ein einzelnes % in einem
+            # unkodierten Altbestand bleibt sonst auf der Strecke.
+            if [ ${#hex} -eq 2 ] && [[ "$hex" =~ ^[0-9a-fA-F]{2}$ ]]; then
+                out="$out$(printf '\\x%s' "$hex")"
+                i=$((i + 2))
+                continue
+            fi
+        fi
+        out="$out$c"
+    done
+    printf '%b' "$out"
 }
 
 # Maskiert das Passwort in einer mysql://... oder smtp://...-URL für die

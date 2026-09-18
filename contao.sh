@@ -53,6 +53,12 @@ CONTAO_PHP_COMPAT=(
 # getroffenen Auswahl.
 PHP_BIN_OVERRIDE=""
 
+# PHP-Versionen, die im DDEV-Menü zur Auswahl stehen (nur relevant, wenn das
+# Projekt in einem DDEV-Projekt liegt). Die Liste bestimmt nur die Auswahl im
+# Menü - welche Versionen das installierte DDEV tatsächlich kann, entscheidet
+# DDEV selbst.
+DDEV_PHP_VERSIONS=(8.1 8.2 8.3 8.4 8.5)
+
 # Datei (relativ zum Script-Ordner), in der projektspezifische Einstellungen
 # stehen - wird per 'source' eingebunden (echtes Bash, kein reines
 # Zeilenformat) und überschreibt bei Bedarf die Standard-Werte aus diesem
@@ -102,7 +108,7 @@ FRESH_INSTALL_VERSIONS=(
 # jeder Änderung an contao.sh/_contao-lib.sh die PATCH-Stelle hochzählen
 # (1.1.0 -> 1.1.1 -> 1.1.2 ...), bei größeren Feature-Sprüngen die
 # MINOR-Stelle.
-CONTAO_SH_VERSION="1.2.0"
+CONTAO_SH_VERSION="1.4.0"
 TOOL_TITLE="Contao PfeilShell - V${CONTAO_SH_VERSION}"
 
 set -u
@@ -153,7 +159,31 @@ if [ -f "$CONTAO_CONF_FILE" ]; then
     source "$CONTAO_CONF_FILE"
 fi
 
-contao_resolve_php
+# Composer braucht bei Contao-Projekten regelmäßig mehr Speicher, als das
+# CLI-PHP per php.ini erlaubt (auf Hosting-Umgebungen oft 128/256 MB) - der
+# Abhängigkeitsbaum ist groß genug, dass "Allowed memory size exhausted"
+# mitten im Update der Normalfall ist. Composer wertet dafür
+# COMPOSER_MEMORY_LIMIT aus. Ein in .contao.conf gesetzter eigener Wert
+# bleibt erhalten (z.B. "2G" statt unbegrenzt, wenn der Hoster hart
+# begrenzt und der Prozess sonst vom OOM-Killer beendet wird).
+export COMPOSER_MEMORY_LIMIT="${COMPOSER_MEMORY_LIMIT:--1}"
+
+# Dialog-Backend vor der Umgebungserkennung ermitteln: startet das
+# DDEV-Projekt nicht, wird hier bereits eine Rückfrage gestellt.
+contao_detect_dialog
+
+# Host oder DDEV? Im DDEV-Betrieb liefert contao_setup_runtime PHP_CMD und
+# COMPOSER_CMD fertig verdrahtet, eine PHP-Suche auf dem Host entfällt
+# komplett - dort muss gar kein PHP installiert sein.
+if contao_setup_runtime "$SCRIPT_DIR"; then
+    if ! contao_ddev_ensure_running; then
+        contao_cleanup_theme
+        exit 1
+    fi
+else
+    contao_resolve_php
+    PHP_CMD=("$PHP_BIN")
+fi
 
 # Live-Check pro Start: welche PHP-Version ist gerade tatsächlich aktiv,
 # passt das zur installierten Contao-Version (CONTAO_PHP_COMPAT)? Läuft
@@ -180,6 +210,11 @@ if [ ! -f "$CONTAO_CONF_FILE" ]; then
 # Konfig-Block von contao.sh, ohne contao.sh selbst anzufassen.
 TESTMAIL_FROM="$TESTMAIL_FROM_DEFAULT"
 TESTMAIL_TO="$TESTMAIL_TO_DEFAULT"
+
+# Liegt das Projekt in einem DDEV-Projekt, laufen PHP, Composer und die
+# Contao-Console automatisch im Container. Mit "off" wird das abgeschaltet
+# und stattdessen das PHP des Hosts verwendet.
+# CONTAO_DDEV_MODE="off"
 
 # Erweiterungen für "Erweiterungen installieren/entfernen". Frei anpassbar -
 # Zeilen ergänzen, ändern oder löschen. Format je Zeile:
@@ -210,8 +245,6 @@ EOF
     fi
     contao_log "Projektspezifische $CONTAO_CONF_FILE_REL neu angelegt (PHP: ${PHP_BIN:-nicht gefunden})"
 fi
-
-contao_detect_dialog
 
 # ----- Grundinstallation (nur relevant, wenn noch kein Projekt existiert) ----
 
@@ -250,7 +283,14 @@ action_fresh_install() {
     # Kommentar bei contao_resolve_composer() in _contao-lib.sh. composer.phar
     # im Zielordner hat Vorrang (wird initial oft manuell abgelegt), sonst
     # automatischer Download.
-    if [ -f "$SCRIPT_DIR/composer.phar" ]; then
+    if [ "$CONTAO_SH_RUNTIME" = "ddev" ]; then
+        # Im DDEV-Projekt kommt Composer aus dem Container - eine
+        # composer.phar auf dem Host hilft hier nicht weiter.
+        fresh_composer_cmd=(ddev composer)
+        composer_desc="ddev composer"
+        echo ""
+        echo "Verwende Composer aus dem DDEV-Container \"$CONTAO_SH_DDEV_NAME\"."
+    elif [ -f "$SCRIPT_DIR/composer.phar" ]; then
         fresh_composer_cmd=("$PHP_BIN" "$SCRIPT_DIR/composer.phar")
         composer_desc="php composer.phar"
         echo ""
@@ -267,12 +307,12 @@ action_fresh_install() {
         return 1
     fi
 
-    if [ -n "$PHP_BIN" ]; then
+    if contao_php_available; then
         local cur_ver
-        cur_ver="$("$PHP_BIN" -r 'echo PHP_VERSION;' 2>/dev/null)"
-        if [ -n "$cur_ver" ] && ! "$PHP_BIN" -r "exit(version_compare(PHP_VERSION, '$min_php', '>=') ? 0 : 1);" 2>/dev/null; then
+        cur_ver="$("${PHP_CMD[@]-}" -r 'echo PHP_VERSION;' 2>/dev/null)"
+        if [ -n "$cur_ver" ] && ! "${PHP_CMD[@]-}" -r "exit(version_compare(PHP_VERSION, '$min_php', '>=') ? 0 : 1);" 2>/dev/null; then
             echo ""
-            echo "${C_ORANGE}WARNUNG: $label benötigt mindestens PHP $min_php, gefunden: $cur_ver ($PHP_BIN).${C_RESET}"
+            echo "${C_ORANGE}WARNUNG: $label benötigt mindestens PHP $min_php, gefunden: $cur_ver (${PHP_CMD[*]-}).${C_RESET}"
         fi
     fi
 
@@ -360,6 +400,10 @@ if [ -z "$PROJECT_ROOT" ]; then
 fi
 cd "$PROJECT_ROOT" || exit 1
 
+# Liegt das Projekt in einem Unterverzeichnis des DDEV-Projekts, muss
+# "ddev exec" dort arbeiten - jetzt, wo PROJECT_ROOT feststeht, neu setzen.
+contao_setup_runtime "$SCRIPT_DIR" "$PROJECT_ROOT" >/dev/null
+
 PHP_VERSION_STR="$(contao_check_php "$REQUIRED_PHP")"
 php_check_rc=$?
 if [ $php_check_rc -eq 1 ]; then
@@ -367,18 +411,27 @@ if [ $php_check_rc -eq 1 ]; then
 fi
 # rc=2 -> nur Warnung, weiter gehts
 
-if ! contao_resolve_composer "$PROJECT_ROOT"; then
-    echo "FEHLER: Keine composer.phar im Projekt-Root gefunden, und der automatische" >&2
-    echo "        Download ist fehlgeschlagen. composer.phar manuell ablegen:" >&2
-    echo "        https://getcomposer.org" >&2
-    exit 1
+# Im DDEV-Betrieb bringt der Container seinen Composer mit (ddev composer) -
+# eine composer.phar im Projekt-Root wäre dort nicht nur überflüssig,
+# sondern liefe auch gegen das PHP des Hosts.
+if [ "$CONTAO_SH_RUNTIME" != "ddev" ]; then
+    if ! contao_resolve_composer "$PROJECT_ROOT"; then
+        echo "FEHLER: Keine composer.phar im Projekt-Root gefunden, und der automatische" >&2
+        echo "        Download ist fehlgeschlagen. composer.phar manuell ablegen:" >&2
+        echo "        https://getcomposer.org" >&2
+        exit 1
+    fi
 fi
 
-CONSOLE_CMD=("$PHP_BIN" "$PROJECT_ROOT/vendor/bin/contao-console")
+contao_build_console_cmds "$PROJECT_ROOT"
 ENV_FILE="$PROJECT_ROOT/$ENV_FILE_REL"
 BACKUP_DIR="$PROJECT_ROOT/$BACKUP_DIR_REL"
 
-contao_log "contao.sh gestartet (Projekt-Root: $PROJECT_ROOT, PHP: ${PHP_VERSION_STR:-unbekannt})"
+if [ "$CONTAO_SH_RUNTIME" = "ddev" ]; then
+    contao_log "contao.sh gestartet (Projekt-Root: $PROJECT_ROOT, DDEV: $CONTAO_SH_DDEV_NAME, PHP: ${PHP_VERSION_STR:-unbekannt})"
+else
+    contao_log "contao.sh gestartet (Projekt-Root: $PROJECT_ROOT, PHP: ${PHP_VERSION_STR:-unbekannt})"
+fi
 
 # ----- Migrate & Cache --------------------------------------------------------
 
@@ -397,9 +450,7 @@ action_migrate_nobackup() {
 }
 
 action_cache_clear() {
-    echo ""
-    echo "-> rm -rf var/cache/prod"
-    rm -rf "$PROJECT_ROOT/var/cache/prod"
+    contao_purge_cache_dir prod
     contao_run "Cache clear" "${CONSOLE_CMD[@]-}" cache:clear --no-warmup
     contao_run "Cache warmup" "${CONSOLE_CMD[@]-}" cache:warmup
     contao_pause
@@ -411,9 +462,7 @@ action_cache_clear() {
 action_cache_clear_both() {
     local env
     for env in prod dev; do
-        echo ""
-        echo "-> rm -rf var/cache/$env"
-        rm -rf "$PROJECT_ROOT/var/cache/$env"
+        contao_purge_cache_dir "$env"
         contao_run "Cache clear ($env)" "${CONSOLE_CMD[@]-}" cache:clear --no-warmup --env="$env"
         contao_run "Cache warmup ($env)" "${CONSOLE_CMD[@]-}" cache:warmup --env="$env"
     done
@@ -421,9 +470,7 @@ action_cache_clear_both() {
 }
 
 action_cache_migrate() {
-    echo ""
-    echo "-> rm -rf var/cache/prod"
-    rm -rf "$PROJECT_ROOT/var/cache/prod"
+    contao_purge_cache_dir prod
     contao_run "Cache clear" "${CONSOLE_CMD[@]-}" cache:clear --no-warmup
     contao_run "Cache warmup" "${CONSOLE_CMD[@]-}" cache:warmup
     contao_run "Migrate mit Backup" "${CONSOLE_CMD[@]-}" contao:migrate
@@ -434,12 +481,16 @@ action_cache_migrate() {
 
 action_phpinfo() {
     echo ""
-    echo "Verwendetes PHP-Binary: $PHP_BIN"
-    "$PHP_BIN" -v
+    if [ "$CONTAO_SH_RUNTIME" = "ddev" ]; then
+        echo "Verwendetes PHP: im DDEV-Container \"$CONTAO_SH_DDEV_NAME\" (${PHP_CMD[*]-})"
+    else
+        echo "Verwendetes PHP-Binary: $PHP_BIN"
+    fi
+    "${PHP_CMD[@]-}" -v
     echo ""
-    echo "Geladene Extensions ($PHP_BIN -m):"
-    "$PHP_BIN" -m
-    contao_log "PHP-Info angezeigt ($PHP_BIN)"
+    echo "Geladene Extensions (php -m):"
+    "${PHP_CMD[@]-}" -m
+    contao_log "PHP-Info angezeigt (${PHP_CMD[*]-})"
     contao_pause
 }
 
@@ -448,11 +499,18 @@ action_phpinfo() {
 # Composer und contao-console sofort mit der neuen Version laufen.
 contao_refresh_php_dependents() {
     contao_check_php "$REQUIRED_PHP" >/dev/null 2>&1
-    contao_resolve_composer "$PROJECT_ROOT"
-    CONSOLE_CMD=("$PHP_BIN" "$PROJECT_ROOT/vendor/bin/contao-console")
+    [ "$CONTAO_SH_RUNTIME" = "ddev" ] || contao_resolve_composer "$PROJECT_ROOT"
+    contao_build_console_cmds "$PROJECT_ROOT"
 }
 
 action_php_select() {
+    # Im DDEV-Betrieb entscheidet .ddev/config.yaml über die PHP-Version,
+    # nicht ein Binary auf dem Host - die Host-Kandidatenliste wäre hier
+    # schlicht die falsche Frage.
+    if [ "$CONTAO_SH_RUNTIME" = "ddev" ]; then
+        action_ddev_php_version
+        return
+    fi
     contao_collect_php_candidates
     local -a idx_paths=()
     local -a menu_args=()
@@ -538,6 +596,11 @@ action_composer_version() {
 }
 
 action_composer_phar_download() {
+    if [ "$CONTAO_SH_RUNTIME" = "ddev" ]; then
+        contao_msgbox "Composer im DDEV-Betrieb" "Composer kommt hier aus dem DDEV-Container (ddev composer) - eine\ncomposer.phar im Projekt-Root wird nicht verwendet und liefe gegen das\nPHP des Hosts.\n\nDie Composer-Version im Container steuert .ddev/config.yaml\n(composer_version), zu aktualisieren mit: ddev restart"
+        return
+    fi
+
     local target="$PROJECT_ROOT/composer.phar" prompt
     if [ -f "$target" ]; then
         prompt="Vorhandene composer.phar unter\n$target\ndurch die aktuelle Version von getcomposer.org ersetzen?"
@@ -559,6 +622,11 @@ action_composer_phar_download() {
 }
 
 action_composer_selfupdate() {
+    if [ "$CONTAO_SH_RUNTIME" = "ddev" ]; then
+        contao_msgbox "Composer im DDEV-Betrieb" "Composer kommt hier aus dem DDEV-Container (ddev composer) - eine\ncomposer.phar im Projekt-Root wird nicht verwendet und liefe gegen das\nPHP des Hosts.\n\nDie Composer-Version im Container steuert .ddev/config.yaml\n(composer_version), zu aktualisieren mit: ddev restart"
+        return
+    fi
+
     if contao_yesno "Composer Selfupdate" "composer.phar selfupdate ausführen?"; then
         contao_run "composer selfupdate" "${COMPOSER_CMD[@]-}" selfupdate
     else
@@ -588,6 +656,166 @@ action_composer_update_all() {
         echo "Abgebrochen."
     fi
     contao_pause
+}
+
+action_composer_install() {
+    if contao_yesno "Composer Install" "composer install ausführen?\n\nInstalliert exakt die in composer.lock festgehaltenen Versionen - der\nübliche Schritt nach git clone/pull oder einem Deployment, im Gegensatz\nzu update, das die Versionen neu auflöst."; then
+        contao_run "composer install" "${COMPOSER_CMD[@]-}" install
+        # vendor/bin/* existiert vor dem ersten install noch nicht - die vom
+        # PHP-Binary abhängigen Kommandos danach neu aufbauen.
+        contao_refresh_php_dependents
+        if contao_yesno "contao-setup" "Im Anschluss vendor/bin/contao-setup ausführen?\n(legt Verzeichnisse an, veröffentlicht Assets, leert den Cache -\nnormalerweise direkt nach einem install fällig)"; then
+            action_contao_setup noprompt
+        fi
+    else
+        echo "Abgebrochen."
+    fi
+    contao_pause
+}
+
+# contao-setup ist der von contao/manager-bundle bereitgestellte
+# Nachbereitungsschritt (contao:setup) - Verzeichnisse, Assets, Symlinks,
+# Cache. Composer ruft ihn bei install/update über ein Script selbst auf;
+# wenn das dort z.B. wegen Speichermangel abgebrochen ist, fehlt er.
+action_contao_setup() {
+    local quiet="${1:-}"
+    if [ ! -f "$PROJECT_ROOT/vendor/bin/contao-setup" ]; then
+        contao_msgbox "contao-setup" "vendor/bin/contao-setup nicht gefunden.\n\nDas Kommando liefert contao/manager-bundle - zuerst composer install\nausführen."
+        [ "$quiet" = "noprompt" ] || contao_pause
+        return 1
+    fi
+    if [ "$quiet" = "noprompt" ] || contao_yesno "contao-setup" "vendor/bin/contao-setup ausführen?\n(legt Verzeichnisse an, veröffentlicht Assets, leert den Cache)"; then
+        contao_run "contao-setup" "${SETUP_CMD[@]-}"
+    else
+        echo "Abgebrochen."
+    fi
+    [ "$quiet" = "noprompt" ] || contao_pause
+}
+
+# ----- DDEV --------------------------------------------------------------------
+
+# Schreibt die PHP-Version in .ddev/config.yaml und startet den Container
+# neu. "ddev config" ist der vorgesehene Weg dafür - die YAML-Datei von Hand
+# zu editieren würde Kommentare und Formatierung der Datei zerlegen.
+action_ddev_php_version() {
+    local choice new_ver menu_args=() v i=1
+    for v in "${DDEV_PHP_VERSIONS[@]-}"; do
+        if [ "$v" = "$CONTAO_SH_DDEV_PHP" ]; then
+            menu_args+=("$i" "PHP $v  (aktuell)")
+        else
+            menu_args+=("$i" "PHP $v")
+        fi
+        i=$((i + 1))
+    done
+    menu_args+=(0 "Abbrechen")
+
+    choice="$(contao_menu "DDEV: PHP-Version" "Projekt \"$CONTAO_SH_DDEV_NAME\", aktuell PHP ${CONTAO_SH_DDEV_PHP:-unbekannt}.\nDie Auswahl wird in .ddev/config.yaml geschrieben." "${menu_args[@]-}")"
+    [ -z "$choice" ] || [ "$choice" = "0" ] && { echo "Abgebrochen."; contao_pause; return; }
+
+    new_ver="${DDEV_PHP_VERSIONS[$((choice - 1))]-}"
+    [ -z "$new_ver" ] && { echo "Abgebrochen."; contao_pause; return; }
+
+    if ! contao_run "ddev config --php-version=$new_ver" ddev config --php-version="$new_ver"; then
+        contao_pause
+        return
+    fi
+    if contao_yesno "DDEV neu starten" "PHP $new_ver ist in .ddev/config.yaml eingetragen.\n\nDamit sie wirkt, muss der Container neu starten (ddev restart).\nJetzt ausführen?"; then
+        contao_run "ddev restart" ddev restart
+    fi
+    # Statuszeile und Kompatibilitätswarnung beziehen sich sonst weiter auf
+    # die alte Version.
+    CONTAO_SH_DDEV_PHP="$new_ver"
+    contao_refresh_php_dependents
+    contao_php_compat_check "$PROJECT_ROOT"
+    contao_build_status_line
+    contao_pause
+}
+
+# DDEV-Snapshots sind das lokale Gegenstück zu contao:backup - sie sichern
+# die Datenbank des Containers, unabhängig von Contao und damit auch dann,
+# wenn eine Migration das Schema zerlegt hat.
+action_ddev_snapshot_create() {
+    local name
+    name="$(contao_inputbox "DDEV-Snapshot" "Name des Snapshots (leer = automatischer Zeitstempel-Name):" "")"
+    if [ -n "$name" ]; then
+        contao_run "ddev snapshot --name $name" ddev snapshot --name "$name"
+    else
+        contao_run "ddev snapshot" ddev snapshot
+    fi
+    contao_pause
+}
+
+action_ddev_snapshot_restore() {
+    echo ""
+    echo "Vorhandene Snapshots:"
+    ddev snapshot --list 2>&1
+    echo ""
+
+    local name
+    name="$(contao_inputbox "Snapshot wiederherstellen" "Name des Snapshots (leer = zuletzt erstellter):" "")"
+
+    local target_desc="der zuletzt erstellte Snapshot"
+    [ -n "$name" ] && target_desc="Snapshot \"$name\""
+
+    if ! contao_confirm_dangerous "Die Datenbank des DDEV-Projekts \"$CONTAO_SH_DDEV_NAME\" wird durch $target_desc ersetzt. Alle seitdem entstandenen Daten gehen verloren."; then
+        echo "Abgebrochen."
+        contao_pause
+        return
+    fi
+
+    if [ -n "$name" ]; then
+        contao_run "ddev snapshot restore $name" ddev snapshot restore "$name"
+    else
+        contao_run "ddev snapshot restore --latest" ddev snapshot restore --latest
+    fi
+    contao_pause
+}
+
+# Die Zugangsdaten eines DDEV-Projekts sind fest vorgegeben (db/db/db auf
+# Host "db", Mailpit auf Port 1025) - sie von Hand einzutippen ist
+# fehleranfällig und bei 20 Projekten schlicht Verschwendung.
+action_ddev_env_defaults() {
+    local db_url="mysql://db:db@db:3306/db"
+    local mailer_dsn="smtp://localhost:1025"
+
+    if ! contao_yesno "DDEV-Standardwerte" "In $ENV_FILE_REL eintragen:\n\nDATABASE_URL=\"$db_url\"\nMAILER_DSN=\"$mailer_dsn\"\n\n(Datenbank und Mailpit des DDEV-Containers. Eine bestehende Datei wird\nvorher gesichert.)"; then
+        echo "Abgebrochen."
+        contao_pause
+        return
+    fi
+
+    contao_env_set_value "DATABASE_URL" "DATABASE_URL=\"$db_url\"" "$ENV_FILE"
+    contao_env_set_value "MAILER_DSN" "MAILER_DSN=\"$mailer_dsn\"" "$ENV_FILE" no_backup
+    contao_log "DATABASE_URL/MAILER_DSN auf DDEV-Standardwerte gesetzt"
+    echo ""
+    echo "Gespeichert: $ENV_FILE"
+    echo "Mailpit erreichbar über: ddev mailpit"
+    contao_pause
+}
+
+action_ddev_menu() {
+    while true; do
+        local choice
+        choice="$(contao_menu "DDEV: $CONTAO_SH_DDEV_NAME" "Projekt-Root: $PROJECT_ROOT" \
+            1 "PHP-Version des Containers wählen" \
+            2 "Snapshot der Datenbank erstellen" \
+            3 "Datenbank aus Snapshot wiederherstellen" \
+            4 "$ENV_FILE_REL auf DDEV-Standardwerte setzen" \
+            5 "Projekt neu starten (ddev restart)" \
+            6 "Projektinfos anzeigen (ddev describe)" \
+            0 "Zurück")"
+        [ -z "$choice" ] && break
+        case "$choice" in
+            1) action_ddev_php_version ;;
+            2) action_ddev_snapshot_create ;;
+            3) action_ddev_snapshot_restore ;;
+            4) action_ddev_env_defaults ;;
+            5) contao_run "ddev restart" ddev restart; contao_pause ;;
+            6) ddev describe; contao_pause ;;
+            0) break ;;
+            *) : ;;
+        esac
+    done
 }
 
 # ----- Erweiterungen ------------------------------------------------------------
@@ -823,6 +1051,61 @@ action_crawl() {
     contao_pause
 }
 
+# Contao arbeitet seit 5.x mit Symfony Messenger: Cronjobs und
+# Hintergrundarbeit (Suchindex, Bildbearbeitung, Benachrichtigungen) laufen
+# über Queues. contao:cron ist der Einstiegspunkt, den sonst der Webcron
+# oder ein System-Cron anstößt - hier für den manuellen Anstoß und zum
+# Nachsehen, ob die Queue überhaupt läuft.
+action_cron() {
+    contao_run "Cron ausführen" "${CONSOLE_CMD[@]-}" contao:cron
+    contao_pause
+}
+
+# Fehlgeschlagene Messages landen im Failure-Transport und bleiben dort
+# liegen, bis sie jemand ansieht - ohne Blick in diese Queue fehlt bei
+# "die Mails kommen nicht an"/"der Suchindex aktualisiert nicht" die
+# entscheidende Information.
+action_messenger_menu() {
+    while true; do
+        local choice
+        choice="$(contao_menu "Queue / Messenger" "Projekt: $PROJECT_ROOT" \
+            1 "Fehlgeschlagene Messages anzeigen (messenger:failed:show)" \
+            2 "Fehlgeschlagene Messages erneut verarbeiten (retry)" \
+            3 "Fehlgeschlagene Messages verwerfen (remove, mit Rückfrage)" \
+            4 "Worker einmal laufen lassen (messenger:consume, Zeitlimit 60s)" \
+            0 "Zurück")"
+        [ -z "$choice" ] && break
+        case "$choice" in
+            1) contao_run "messenger:failed:show" "${CONSOLE_CMD[@]-}" messenger:failed:show; contao_pause ;;
+            2) contao_run "messenger:failed:retry" "${CONSOLE_CMD[@]-}" messenger:failed:retry; contao_pause ;;
+            3)
+                local id
+                id="$(contao_inputbox "Messages verwerfen" "ID der zu verwerfenden Message (leer = abbrechen).\nIDs zeigt \"Fehlgeschlagene Messages anzeigen\":" "")"
+                if [ -n "$id" ]; then
+                    if contao_confirm_dangerous "Message $id wird endgültig aus der Failure-Queue entfernt und NICHT mehr verarbeitet."; then
+                        contao_run "messenger:failed:remove $id" "${CONSOLE_CMD[@]-}" messenger:failed:remove "$id" --force
+                    else
+                        echo "Abgebrochen."
+                    fi
+                fi
+                contao_pause
+                ;;
+            4)
+                # Ohne Zeitlimit läuft consume endlos und das Menü kommt nicht
+                # zurück - 60 Sekunden reichen, um zu sehen, ob die Queue
+                # abgearbeitet wird. Ohne Transport-Argument fragt Symfony
+                # selbst nach, welcher Transport konsumiert werden soll -
+                # damit bleibt das unabhängig davon, wie die Transporte in
+                # der jeweiligen Contao-Version heißen.
+                contao_run "messenger:consume (60s)" "${CONSOLE_CMD[@]-}" messenger:consume --time-limit=60
+                contao_pause
+                ;;
+            0) break ;;
+            *) : ;;
+        esac
+    done
+}
+
 action_testmail() {
     local default_from default_to from to
     # TESTMAIL_FROM/TESTMAIL_TO kommen - falls in .contao.conf gesetzt -
@@ -855,8 +1138,8 @@ action_env_database() {
     local existing
     existing="$(contao_env_get_value "DATABASE_URL" "$ENV_FILE" 2>/dev/null)"
     if [ -n "$existing" ] && [[ "$existing" =~ ^mysql://([^:@/]*):([^@]*)@([^:/]+):([0-9]+)/(.+)$ ]]; then
-        cur_user="${BASH_REMATCH[1]}"
-        cur_pass="${BASH_REMATCH[2]}"
+        cur_user="$(contao_rawurldecode "${BASH_REMATCH[1]}")"
+        cur_pass="$(contao_rawurldecode "${BASH_REMATCH[2]}")"
         cur_host="${BASH_REMATCH[3]}"
         cur_port="${BASH_REMATCH[4]}"
         cur_db="${BASH_REMATCH[5]}"
@@ -878,7 +1161,9 @@ action_env_database() {
     pass="$(contao_passwordbox "Datenbank" "Passwort (leer lassen = bisheriges Passwort behalten):")" || { echo "Abgebrochen."; contao_pause; return; }
     [ -z "$pass" ] && pass="$cur_pass"
 
-    local new_url="mysql://${user}:${pass}@${host}:${port}/${dbname}"
+    # User/Passwort prozent-kodiert einsetzen (siehe contao_rawurlencode) -
+    # sonst zerlegt parse_url() eine DSN mit Sonderzeichen im Passwort falsch.
+    local new_url="mysql://$(contao_rawurlencode "$user"):$(contao_rawurlencode "$pass")@${host}:${port}/${dbname}"
     local line="DATABASE_URL=\"$new_url\""
 
     echo ""
@@ -904,8 +1189,8 @@ action_env_mailer() {
     local existing
     existing="$(contao_env_get_value "MAILER_DSN" "$ENV_FILE" 2>/dev/null)"
     if [ -n "$existing" ] && [[ "$existing" =~ ^smtp://([^:@/]*):([^@]*)@([^:/?]+):([0-9]+)(\?encryption=([a-zA-Z0-9]+))?$ ]]; then
-        cur_user="${BASH_REMATCH[1]}"
-        cur_pass="${BASH_REMATCH[2]}"
+        cur_user="$(contao_rawurldecode "${BASH_REMATCH[1]}")"
+        cur_pass="$(contao_rawurldecode "${BASH_REMATCH[2]}")"
         cur_host="${BASH_REMATCH[3]}"
         cur_port="${BASH_REMATCH[4]}"
         [ -n "${BASH_REMATCH[6]}" ] && cur_enc="${BASH_REMATCH[6]}"
@@ -938,9 +1223,12 @@ action_env_mailer() {
         *) echo "Abgebrochen."; contao_pause; return ;;
     esac
 
-    local new_dsn="smtp://${user}:${pass}@${host}:${port}"
+    local new_dsn="smtp://$(contao_rawurlencode "$user"):$(contao_rawurlencode "$pass")@${host}:${port}"
     [ -n "$enc" ] && new_dsn="${new_dsn}?encryption=${enc}"
-    local line="MAILER_DSN=${new_dsn}"
+    # Wert in Anführungszeichen - eine unquotierte DSN mit # würde von
+    # Symfony/Dotenv ab dem # als Kommentar gelesen (DATABASE_URL unten
+    # macht es bereits so).
+    local line="MAILER_DSN=\"$new_dsn\""
 
     echo ""
     echo "Neue MAILER_DSN: $(contao_env_mask_url "$new_dsn")"
@@ -1101,6 +1389,7 @@ contao_build_status_line
 MAIN_MENU_INTRO_FULL="Deine pfeilschnelle Kommandozentrale für Update, Installation, Migration, Cache und viele weitere Helferchen."
 MAIN_MENU_INTRO_SHORT=""
 main_menu_shown=0
+main_menu_args=()
 
 while true; do
     if [ "$main_menu_shown" = "0" ]; then
@@ -1109,40 +1398,52 @@ while true; do
     else
         main_menu_prompt="$MAIN_MENU_INTRO_SHORT"
     fi
-    choice="$(contao_menu "$TOOL_TITLE" "$main_menu_prompt" \
-        "#" "System" \
-        1  "PHP-Info anzeigen" \
-        2  "PHP-Version wählen" \
-        "#" "Composer" \
-        3  "Composer: installierte Pakete anzeigen" \
-        4  "Composer: verfügbare Updates anzeigen (show -l)" \
-        5  "Composer Version anzeigen" \
-        6  "composer.phar herunterladen/aktualisieren" \
-        7  "Composer Selfupdate" \
-        8  "Composer Update (mit Memory-Profil)" \
-        9  "Composer Update (Dry-Run / Testlauf)" \
-        10 "Composer Update (alle Pakete aktualisieren)" \
-        "#" "Cache" \
-        11 "Cache leeren" \
-        12 "Cache leeren (prod + dev)" \
-        "#" "Datenbank + Migration" \
-        13 "Migrate (mit automatischem Backup)" \
-        14 "Migrate ohne Backup" \
-        15 "Cache leeren + Migrate" \
-        16 "Datenbank sichern (contao:backup:create)" \
-        17 "Vorhandene Backups auflisten (contao:backup:list)" \
-        18 "Datenbank aus Backup wiederherstellen (contao:backup:restore)" \
-        19 "Migrate-Debugging (Dry-Run-Varianten)" \
-        "#" "Erweiterungen" \
-        20 "Erweiterungen installieren (Checkbox-Auswahl)" \
-        21 "Erweiterungen suchen (Packagist)" \
-        22 "Erweiterungen entfernen (composer remove)" \
-        "#" "Werkzeuge" \
-        23 "Dateiverwaltung abgleichen (contao:filesync)" \
-        24 "Suchindex aufbauen (contao:crawl)" \
-        25 "Test-E-Mail versenden (mailer:send)" \
-        26 "$ENV_FILE_REL konfigurieren (DATABASE_URL / MAILER_DSN)" \
-        0  "Beenden")"
+    main_menu_args=(
+        "#" "System"
+        1  "PHP-Info anzeigen"
+        2  "PHP-Version wählen"
+        "#" "Composer"
+        3  "Composer: installierte Pakete anzeigen"
+        4  "Composer: verfügbare Updates anzeigen (show -l)"
+        5  "Composer Version anzeigen"
+        6  "composer.phar herunterladen/aktualisieren"
+        7  "Composer Selfupdate"
+        8  "Composer Install (Versionen aus composer.lock)"
+        9  "Composer Update (mit Memory-Profil)"
+        10 "Composer Update (Dry-Run / Testlauf)"
+        11 "Composer Update (alle Pakete aktualisieren)"
+        12 "contao-setup ausführen (Verzeichnisse/Assets/Cache)"
+        "#" "Cache"
+        13 "Cache leeren"
+        14 "Cache leeren (prod + dev)"
+        "#" "Datenbank + Migration"
+        15 "Migrate (mit automatischem Backup)"
+        16 "Migrate ohne Backup"
+        17 "Cache leeren + Migrate"
+        18 "Datenbank sichern (contao:backup:create)"
+        19 "Vorhandene Backups auflisten (contao:backup:list)"
+        20 "Datenbank aus Backup wiederherstellen (contao:backup:restore)"
+        21 "Migrate-Debugging (Dry-Run-Varianten)"
+        "#" "Erweiterungen"
+        22 "Erweiterungen installieren (Checkbox-Auswahl)"
+        23 "Erweiterungen suchen (Packagist)"
+        24 "Erweiterungen entfernen (composer remove)"
+        "#" "Werkzeuge"
+        25 "Dateiverwaltung abgleichen (contao:filesync)"
+        26 "Suchindex aufbauen (contao:crawl)"
+        27 "Cron ausführen (contao:cron)"
+        28 "Queue / Messenger (fehlgeschlagene Messages)"
+        29 "Test-E-Mail versenden (mailer:send)"
+        30 "$ENV_FILE_REL konfigurieren (DATABASE_URL / MAILER_DSN)"
+    )
+    # Die DDEV-Gruppe nur zeigen, wenn das Projekt auch in einem DDEV-Projekt
+    # liegt - auf dem Server wäre sie sinnlos.
+    if [ "$CONTAO_SH_RUNTIME" = "ddev" ]; then
+        main_menu_args+=("#" "DDEV" 31 "DDEV-Werkzeuge (Snapshots, PHP-Version, Standardwerte)")
+    fi
+    main_menu_args+=(0 "Beenden")
+
+    choice="$(contao_menu "$TOOL_TITLE" "$main_menu_prompt" "${main_menu_args[@]-}")"
 
     # Leere/ungültige Eingabe (z.B. ESC bei dialog/whiptail, Tippfehler im
     # Textmenü) zeigt nur erneut die Auswahl - NUR ein bewusstes "0"
@@ -1157,25 +1458,30 @@ while true; do
         5) action_composer_version ;;
         6) action_composer_phar_download ;;
         7) action_composer_selfupdate ;;
-        8) action_composer_update_profile ;;
-        9) action_composer_update_dryrun ;;
-        10) action_composer_update_all ;;
-        11) action_cache_clear ;;
-        12) action_cache_clear_both ;;
-        13) action_migrate_backup ;;
-        14) action_migrate_nobackup ;;
-        15) action_cache_migrate ;;
-        16) action_backup_create ;;
-        17) action_backup_list ;;
-        18) action_backup_restore ;;
-        19) action_migrate_debug_menu ;;
-        20) action_install_extensions ;;
-        21) action_extensions_search ;;
-        22) action_extensions_remove ;;
-        23) action_filesync ;;
-        24) action_crawl ;;
-        25) action_testmail ;;
-        26) action_env_menu ;;
+        8) action_composer_install ;;
+        9) action_composer_update_profile ;;
+        10) action_composer_update_dryrun ;;
+        11) action_composer_update_all ;;
+        12) action_contao_setup ;;
+        13) action_cache_clear ;;
+        14) action_cache_clear_both ;;
+        15) action_migrate_backup ;;
+        16) action_migrate_nobackup ;;
+        17) action_cache_migrate ;;
+        18) action_backup_create ;;
+        19) action_backup_list ;;
+        20) action_backup_restore ;;
+        21) action_migrate_debug_menu ;;
+        22) action_install_extensions ;;
+        23) action_extensions_search ;;
+        24) action_extensions_remove ;;
+        25) action_filesync ;;
+        26) action_crawl ;;
+        27) action_cron ;;
+        28) action_messenger_menu ;;
+        29) action_testmail ;;
+        30) action_env_menu ;;
+        31) action_ddev_menu ;;
         0) break ;;
         *) : ;;
     esac
