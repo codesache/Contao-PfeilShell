@@ -790,6 +790,24 @@ contao_pause() {
     echo ""
 }
 
+# Löscht ein var/cache/<env>-Verzeichnis des Projekts.
+# Bewusst mit Guard: PROJECT_ROOT ist zwar zum Aufrufzeitpunkt immer gesetzt,
+# ein leerer Wert würde hier aber "rm -rf /var/cache/<env>" bedeuten - das
+# Risiko lohnt die zwei Zeilen Prüfung nicht.
+contao_purge_cache_dir() {
+    local env="$1" dir
+    if [ -z "${PROJECT_ROOT:-}" ] || [ ! -d "$PROJECT_ROOT" ]; then
+        echo "${C_ORANGE}Übersprungen: Projekt-Root unbekannt, var/cache/$env wird nicht gelöscht.${C_RESET}" >&2
+        return 1
+    fi
+    dir="$PROJECT_ROOT/var/cache/$env"
+    [ -d "$dir" ] || return 0
+    echo ""
+    echo "-> rm -rf var/cache/$env"
+    rm -rf "$dir"
+    return 0
+}
+
 # Führt einen Befehl sichtbar aus (Array als Argumente), loggt Erfolg/Fehler.
 # $1 = Beschreibung fürs Log, ab $2 = Befehl + Argumente
 contao_run() {

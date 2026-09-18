@@ -406,9 +406,7 @@ action_migrate_nobackup() {
 }
 
 action_cache_clear() {
-    echo ""
-    echo "-> rm -rf var/cache/prod"
-    rm -rf "$PROJECT_ROOT/var/cache/prod"
+    contao_purge_cache_dir prod
     contao_run "Cache clear" "${CONSOLE_CMD[@]-}" cache:clear --no-warmup
     contao_run "Cache warmup" "${CONSOLE_CMD[@]-}" cache:warmup
     contao_pause
@@ -420,9 +418,7 @@ action_cache_clear() {
 action_cache_clear_both() {
     local env
     for env in prod dev; do
-        echo ""
-        echo "-> rm -rf var/cache/$env"
-        rm -rf "$PROJECT_ROOT/var/cache/$env"
+        contao_purge_cache_dir "$env"
         contao_run "Cache clear ($env)" "${CONSOLE_CMD[@]-}" cache:clear --no-warmup --env="$env"
         contao_run "Cache warmup ($env)" "${CONSOLE_CMD[@]-}" cache:warmup --env="$env"
     done
@@ -430,9 +426,7 @@ action_cache_clear_both() {
 }
 
 action_cache_migrate() {
-    echo ""
-    echo "-> rm -rf var/cache/prod"
-    rm -rf "$PROJECT_ROOT/var/cache/prod"
+    contao_purge_cache_dir prod
     contao_run "Cache clear" "${CONSOLE_CMD[@]-}" cache:clear --no-warmup
     contao_run "Cache warmup" "${CONSOLE_CMD[@]-}" cache:warmup
     contao_run "Migrate mit Backup" "${CONSOLE_CMD[@]-}" contao:migrate
