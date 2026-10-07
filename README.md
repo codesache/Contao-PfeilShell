@@ -20,7 +20,8 @@ LTS oder 5.7.x LTS, per `composer create-project`).
 
 - **System** - PHP-Info, PHP-Version wählen
 - **Composer** - installierte Pakete/Updates anzeigen, `composer.phar`
-  herunterladen/aktualisieren, Selfupdate, Update (Profil/Dry-Run/normal)
+  herunterladen/aktualisieren, Selfupdate, Update (Profil/Dry-Run/normal),
+  Sicherheitsprüfung (`composer audit`)
 - **Cache** - Cache leeren (aktuelle Umgebung, oder prod + dev)
 - **Datenbank + Migration** - `contao:migrate`, Backup erstellen/auflisten/
   wiederherstellen, Migrate-Debugging
@@ -38,12 +39,25 @@ Erweiterungsliste) landen automatisch in `.contao.conf` im Projekt-Root -
 `contao.sh` selbst bleibt für alle Projekte identisch und enthält keine
 projekteigenen Daten fest im Code.
 
-## Mehr Details
+## Direkter Aufruf per Kommandozeilen-Parameter
 
-Ausführliche technische Dokumentation (alle Menüpunkte im Detail,
-`.contao.conf`-Mechanik, PHP-Erkennung & Kompatibilitäts-Check,
-Statuszeile, Farbschema, Testprotokoll, Design-Entscheidungen): siehe
-README-PfeilShell.md.
+Für Automatisierung/Cron lassen sich einige Aktionen ohne Menü auslösen:
+
+```bash
+./contao.sh cache-clear           # Cache leeren
+./contao.sh cache-clear-all       # Cache leeren (prod + dev)
+./contao.sh migrate               # Migrate (mit automatischem Backup)
+./contao.sh migrate-no-backup     # Migrate ohne Backup
+./contao.sh cache-clear-migrate   # Cache leeren + Migrate
+./contao.sh backup-create         # Datenbank sichern (contao:backup:create)
+./contao.sh audit                 # Sicherheitsprüfung (composer audit --locked)
+./contao.sh --help                # Übersicht aller Parameter
+```
+
+Die Kürzel sind fest und unabhängig von der Menü-Nummerierung; im Menü
+stehen sie in eckigen Klammern hinter der jeweiligen Zeile. Ja/Nein-
+Rückfragen entfallen beim Parameter-Aufruf, der Parameter gilt als
+Zustimmung. `audit` liefert bei Treffern Exit-Code 1.
 
 ---
 
