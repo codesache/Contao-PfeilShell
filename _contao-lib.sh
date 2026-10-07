@@ -719,6 +719,10 @@ contao_print_summary() {
 # Wartet ausschließlich auf die Leertaste (keine andere Taste, auch nicht
 # Enter, führt weiter) - andere Tasten werden stillschweigend ignoriert.
 contao_pause() {
+    # Im CLI-Parameter-Modus (siehe CONTAO_SH_CLI_MODE in contao.sh) gibt es
+    # kein Terminal, das auf einen Tastendruck wartet - sonst würde ein
+    # unbeaufsichtigter Aufruf (z.B. Cron) hier hängen bleiben.
+    [ "${CONTAO_SH_CLI_MODE:-0}" = "1" ] && return 0
     echo ""
     printf "Weiter mit der Leertaste ... "
     local key=""
@@ -1022,6 +1026,10 @@ contao_menu_arrows() {
 # contao_yesno TITLE TEXT -> Exit-Code 0 = Ja
 contao_yesno() {
     local title="$1" text="$2"
+    # Im CLI-Parameter-Modus gilt der Parameter selbst als Zustimmung - keine
+    # Rückfrage, sonst nicht unbeaufsichtigt automatisierbar (siehe
+    # CONTAO_SH_CLI_MODE in contao.sh).
+    [ "${CONTAO_SH_CLI_MODE:-0}" = "1" ] && return 0
     if [ "$DIALOG_BIN" = "dialog" ] || [ "$DIALOG_BIN" = "whiptail" ]; then
         "$DIALOG_BIN" --clear --backtitle "$TOOL_TITLE" --title "$title" --yesno "$text" 12 70
         local rc=$?

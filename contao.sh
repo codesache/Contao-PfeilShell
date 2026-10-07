@@ -102,7 +102,7 @@ FRESH_INSTALL_VERSIONS=(
 # jeder Änderung an contao.sh/_contao-lib.sh die PATCH-Stelle hochzählen
 # (1.1.0 -> 1.1.1 -> 1.1.2 ...), bei größeren Feature-Sprüngen die
 # MINOR-Stelle.
-CONTAO_SH_VERSION="1.2.0"
+CONTAO_SH_VERSION="1.4.0"
 TOOL_TITLE="Contao PfeilShell - V${CONTAO_SH_VERSION}"
 
 set -u
@@ -567,9 +567,20 @@ action_composer_selfupdate() {
     contao_pause
 }
 
+# Kurzer Sicherheitshinweis nach einem Update: prüft still die composer.lock
+# und verweist bei Treffern auf den Menüpunkt "Sicherheitsprüfung".
+contao_audit_hint() {
+    [ -n "${COMPOSER_CMD+x}" ] && [ "${#COMPOSER_CMD[@]}" -ge 2 ] || return 0
+    if ! "${COMPOSER_CMD[@]}" audit --locked --format=summary >/dev/null 2>&1; then
+        echo ""
+        echo "${C_ORANGE}HINWEIS: composer audit meldet Sicherheitshinweise für installierte Pakete.${C_RESET}"
+        echo "${C_ORANGE}Details: Menüpunkt \"Sicherheitsprüfung (composer audit)\" oder ./contao.sh audit${C_RESET}"
+    fi
+}
+
 action_composer_update_profile() {
     if contao_yesno "Composer Update (Profil)" "composer update --profile ausführen?\n(aktualisiert alle Pakete, zeigt Speicherverbrauch)"; then
-        contao_run "composer update --profile" "${COMPOSER_CMD[@]-}" --profile update
+        contao_run "composer update --profile" "${COMPOSER_CMD[@]-}" --profile update && contao_audit_hint
     else
         echo "Abgebrochen."
     fi
@@ -583,11 +594,31 @@ action_composer_update_dryrun() {
 
 action_composer_update_all() {
     if contao_yesno "Composer Update" "composer update ausführen?\nAktualisiert ALLE Pakete auf die neuesten kompatiblen Versionen."; then
-        contao_run "composer update" "${COMPOSER_CMD[@]-}" update
+        contao_run "composer update" "${COMPOSER_CMD[@]-}" update && contao_audit_hint
     else
         echo "Abgebrochen."
     fi
     contao_pause
+}
+
+# Sicherheitsprüfung: gleicht composer.lock mit der Advisory-Datenbank ab,
+# verändert nichts. Exit-Code ungleich 0 = Treffer (kein Programmfehler).
+action_composer_audit() {
+    local rc=0
+    echo ""
+    echo "${C_GREY}-> Ausführen: ${COMPOSER_CMD[*]-} audit --locked${C_RESET}"
+    echo ""
+    "${COMPOSER_CMD[@]-}" audit --locked || rc=$?
+    echo ""
+    if [ "$rc" -eq 0 ]; then
+        contao_log "OK: composer audit (keine Treffer)"
+        echo "${C_GREEN}OK: Keine bekannten Sicherheitslücken in composer.lock.${C_RESET}"
+    else
+        contao_log "composer audit: Treffer/Hinweise (Exit $rc)"
+        echo "${C_ORANGE}Composer meldet Sicherheitshinweise (Exit $rc). Ein Update hilft nur, wenn eine gepatchte Version innerhalb der Constraints der composer.json existiert.${C_RESET}"
+    fi
+    contao_pause
+    return "$rc"
 }
 
 # ----- Erweiterungen ------------------------------------------------------------
@@ -1087,6 +1118,48 @@ action_migrate_debug_menu() {
     done
 }
 
+# ----- Direkter Aufruf per Kommandozeilen-Parameter --------------------------
+
+# Für Automatisierung/Cron: eine bewusst kleine Auswahl unkritischer
+# Aktionen lässt sich direkt per Parameter auslösen, ohne das Menü zu
+# durchlaufen. Nicht alle Menüpunkte eignen sich dafür - Restore braucht
+# z.B. eine Dateiauswahl, Composer-/Erweiterungs-Aktionen können mehrstufig
+# oder je nach Umgebung heikel sein. Die Kürzel stehen zusätzlich im Menü
+# selbst hinter der jeweiligen Zeile in eckigen Klammern.
+# Ja/Nein-Rückfragen entfallen bei Parameter-Aufruf automatisch (siehe
+# CONTAO_SH_CLI_MODE in contao_yesno/contao_pause) - der Parameter selbst
+# gilt als Zustimmung.
+if [ -n "${1:-}" ]; then
+    CONTAO_SH_CLI_MODE=1
+    case "$1" in
+        cache-clear) action_cache_clear; exit 0 ;;
+        cache-clear-all) action_cache_clear_both; exit 0 ;;
+        migrate) action_migrate_backup; exit 0 ;;
+        migrate-no-backup) action_migrate_nobackup; exit 0 ;;
+        cache-clear-migrate) action_cache_migrate; exit 0 ;;
+        backup-create) action_backup_create; exit 0 ;;
+        audit) action_composer_audit; exit $? ;;
+        -h|--help)
+            echo "Verfügbare Parameter (führen die Aktion direkt aus, ohne Menü):"
+            echo "  cache-clear           Cache leeren"
+            echo "  cache-clear-all       Cache leeren (prod + dev)"
+            echo "  migrate               Migrate (mit automatischem Backup)"
+            echo "  migrate-no-backup     Migrate ohne Backup"
+            echo "  cache-clear-migrate   Cache leeren + Migrate"
+            echo "  backup-create         Datenbank sichern (contao:backup:create)"
+            echo "  audit                 Sicherheitsprüfung (composer audit --locked, Exit 1 bei Treffern)"
+            echo "Ohne Parameter startet das interaktive Menü."
+            exit 0
+            ;;
+        *)
+            echo "FEHLER: Unbekannter Parameter '$1'." >&2
+            echo "Verfügbar: cache-clear, cache-clear-all, migrate, migrate-no-backup, cache-clear-migrate, backup-create, audit" >&2
+            echo "(--help für Details, ohne Parameter startet das interaktive Menü)" >&2
+            exit 1
+            ;;
+    esac
+fi
+
 # ----- Hauptmenü --------------------------------------------------------------
 
 # Pfad-Zeile: wird - wie im demo-contao.sh-Vorbild - bei JEDEM Menü-Redraw
@@ -1122,26 +1195,27 @@ while true; do
         8  "Composer Update (mit Memory-Profil)" \
         9  "Composer Update (Dry-Run / Testlauf)" \
         10 "Composer Update (alle Pakete aktualisieren)" \
+        11 "Sicherheitsprüfung (composer audit) [audit]" \
         "#" "Cache" \
-        11 "Cache leeren" \
-        12 "Cache leeren (prod + dev)" \
+        12 "Cache leeren [cache-clear]" \
+        13 "Cache leeren (prod + dev) [cache-clear-all]" \
         "#" "Datenbank + Migration" \
-        13 "Migrate (mit automatischem Backup)" \
-        14 "Migrate ohne Backup" \
-        15 "Cache leeren + Migrate" \
-        16 "Datenbank sichern (contao:backup:create)" \
-        17 "Vorhandene Backups auflisten (contao:backup:list)" \
-        18 "Datenbank aus Backup wiederherstellen (contao:backup:restore)" \
-        19 "Migrate-Debugging (Dry-Run-Varianten)" \
+        14 "Migrate (mit automatischem Backup) [migrate]" \
+        15 "Migrate ohne Backup [migrate-no-backup]" \
+        16 "Cache leeren + Migrate [cache-clear-migrate]" \
+        17 "Datenbank sichern (contao:backup:create) [backup-create]" \
+        18 "Vorhandene Backups auflisten (contao:backup:list)" \
+        19 "Datenbank aus Backup wiederherstellen (contao:backup:restore)" \
+        20 "Migrate-Debugging (Dry-Run-Varianten)" \
         "#" "Erweiterungen" \
-        20 "Erweiterungen installieren (Checkbox-Auswahl)" \
-        21 "Erweiterungen suchen (Packagist)" \
-        22 "Erweiterungen entfernen (composer remove)" \
+        21 "Erweiterungen installieren (Checkbox-Auswahl)" \
+        22 "Erweiterungen suchen (Packagist)" \
+        23 "Erweiterungen entfernen (composer remove)" \
         "#" "Werkzeuge" \
-        23 "Dateiverwaltung abgleichen (contao:filesync)" \
-        24 "Suchindex aufbauen (contao:crawl)" \
-        25 "Test-E-Mail versenden (mailer:send)" \
-        26 "$ENV_FILE_REL konfigurieren (DATABASE_URL / MAILER_DSN)" \
+        24 "Dateiverwaltung abgleichen (contao:filesync)" \
+        25 "Suchindex aufbauen (contao:crawl)" \
+        26 "Test-E-Mail versenden (mailer:send)" \
+        27 "$ENV_FILE_REL konfigurieren (DATABASE_URL / MAILER_DSN)" \
         0  "Beenden")"
 
     # Leere/ungültige Eingabe (z.B. ESC bei dialog/whiptail, Tippfehler im
@@ -1160,22 +1234,23 @@ while true; do
         8) action_composer_update_profile ;;
         9) action_composer_update_dryrun ;;
         10) action_composer_update_all ;;
-        11) action_cache_clear ;;
-        12) action_cache_clear_both ;;
-        13) action_migrate_backup ;;
-        14) action_migrate_nobackup ;;
-        15) action_cache_migrate ;;
-        16) action_backup_create ;;
-        17) action_backup_list ;;
-        18) action_backup_restore ;;
-        19) action_migrate_debug_menu ;;
-        20) action_install_extensions ;;
-        21) action_extensions_search ;;
-        22) action_extensions_remove ;;
-        23) action_filesync ;;
-        24) action_crawl ;;
-        25) action_testmail ;;
-        26) action_env_menu ;;
+        11) action_composer_audit || true ;;
+        12) action_cache_clear ;;
+        13) action_cache_clear_both ;;
+        14) action_migrate_backup ;;
+        15) action_migrate_nobackup ;;
+        16) action_cache_migrate ;;
+        17) action_backup_create ;;
+        18) action_backup_list ;;
+        19) action_backup_restore ;;
+        20) action_migrate_debug_menu ;;
+        21) action_install_extensions ;;
+        22) action_extensions_search ;;
+        23) action_extensions_remove ;;
+        24) action_filesync ;;
+        25) action_crawl ;;
+        26) action_testmail ;;
+        27) action_env_menu ;;
         0) break ;;
         *) : ;;
     esac
