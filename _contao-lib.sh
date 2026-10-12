@@ -1413,6 +1413,38 @@ contao_env_unset_value() {
 
 # Maskiert das Passwort in einer mysql://... oder smtp://...-URL für die
 # Anzeige (user:PASS@ -> user:***@).
+# URL-Encoding wie PHP rawurlencode(): alles außer A-Z a-z 0-9 - . _ ~ wird
+# zu %XX (Bytes, daher LC_ALL=C). Nötig für User/Passwort in DATABASE_URL
+# und MAILER_DSN - ein unkodiertes "/", "@", ":" oder "%" bricht sonst das
+# URL-Parsing (z.B. str_replace()-TypeError in contao-setup).
+contao_urlencode() {
+    local LC_ALL=C s="$1" out="" i c
+    for (( i = 0; i < ${#s}; i++ )); do
+        c="${s:i:1}"
+        case "$c" in
+            [a-zA-Z0-9.~_-]) out="${out}${c}" ;;
+            *) out="${out}$(printf '%%%02X' "'$c")" ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
+# Gegenstück: %XX zurück in Zeichen (für die Anzeige/Vorbelegung im Dialog).
+contao_urldecode() {
+    local s="$1"
+    printf '%b' "${s//%/\\x}"
+}
+
+# Bestehender Wert aus der URL: ist er bereits kodiert (nur URL-sichere
+# Zeichen plus %), bleibt er unverändert; enthält er rohe Sonderzeichen
+# (Altbestand), wird er kodiert.
+contao_urlencode_if_raw() {
+    case "$1" in
+        *[!a-zA-Z0-9.~_%-]*) contao_urlencode "$1" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
 contao_env_mask_url() {
     echo "$1" | sed -E 's#(://[^:@/]*:)[^@]*(@)#\1***\2#'
 }

@@ -82,6 +82,13 @@ EXTENSIONS_LIST=()
 TESTMAIL_FROM_DEFAULT="test@MEINEDOMAIN.de"
 TESTMAIL_TO_DEFAULT="anmich@MEINEDOMAIN.de"
 
+# Wartungsmodus um Cache-/Migrate-Aktionen (contao:maintenance-mode), per
+# MAINTENANCE_WRAP in .contao.conf überschreibbar:
+#   ask = bei Migrate-Aktionen nachfragen (Standard; im Parameter-Aufruf aus)
+#   yes = bei allen Cache-/Migrate-Aktionen automatisch ein/aus (auch Parameter)
+#   no  = nie
+MAINTENANCE_WRAP="ask"
+
 # Dateiname der Umgebungs-Konfiguration relativ zum Projekt-Root
 ENV_FILE_REL=".env.local"
 
@@ -102,7 +109,7 @@ FRESH_INSTALL_VERSIONS=(
 # jeder Änderung an contao.sh/_contao-lib.sh die PATCH-Stelle hochzählen
 # (1.1.0 -> 1.1.1 -> 1.1.2 ...), bei größeren Feature-Sprüngen die
 # MINOR-Stelle.
-CONTAO_SH_VERSION="1.4.0"
+CONTAO_SH_VERSION="1.5.0"
 TOOL_TITLE="Contao PfeilShell - V${CONTAO_SH_VERSION}"
 
 set -u
@@ -382,14 +389,71 @@ contao_log "contao.sh gestartet (Projekt-Root: $PROJECT_ROOT, PHP: ${PHP_VERSION
 
 # ----- Migrate & Cache --------------------------------------------------------
 
+# ----- Wartungsmodus-Wrapper ------------------------------------------------------
+
+MAINT_ACTIVE=0
+MAINT_AVAILABLE=""
+
+# Prüft einmalig, ob die Console den Befehl contao:maintenance-mode kennt
+# (je nach Contao-Version/Umgebung nicht selbstverständlich).
+contao_maint_available() {
+    if [ -z "$MAINT_AVAILABLE" ]; then
+        if "${CONSOLE_CMD[@]-}" list --raw 2>/dev/null | grep -q '^contao:maintenance-mode'; then
+            MAINT_AVAILABLE=1
+        else
+            MAINT_AVAILABLE=0
+        fi
+    fi
+    [ "$MAINT_AVAILABLE" = "1" ]
+}
+
+# $1 = Art der Aktion: "migrate" oder "cache". Schaltet den Wartungsmodus
+# ein, wenn MAINTENANCE_WRAP es verlangt (siehe Konfig-Block).
+contao_maint_begin() {
+    local kind="$1" want=0
+    MAINT_ACTIVE=0
+    case "${MAINTENANCE_WRAP:-ask}" in
+        yes) want=1 ;;
+        no) want=0 ;;
+        *)
+            if [ "$kind" = "migrate" ] && [ "${CONTAO_SH_CLI_MODE:-0}" != "1" ]; then
+                contao_yesno "Wartungsmodus" "Wartungsmodus während der Aktion aktivieren?\n(contao:maintenance-mode enable/disable)" && want=1
+            fi
+            ;;
+    esac
+    [ "$want" = "1" ] || return 0
+    if ! contao_maint_available; then
+        echo "${C_ORANGE}Hinweis: contao:maintenance-mode ist in dieser Installation nicht verfügbar - weiter ohne Wartungsmodus.${C_RESET}"
+        return 0
+    fi
+    if contao_run "Wartungsmodus aktivieren" "${CONSOLE_CMD[@]-}" contao:maintenance-mode enable; then
+        MAINT_ACTIVE=1
+    else
+        echo "${C_ORANGE}Wartungsmodus konnte nicht aktiviert werden - weiter ohne.${C_RESET}"
+    fi
+}
+
+# Schaltet den Wartungsmodus wieder aus - auch dann, wenn die Aktion
+# dazwischen fehlgeschlagen ist.
+contao_maint_end() {
+    [ "$MAINT_ACTIVE" = "1" ] || return 0
+    MAINT_ACTIVE=0
+    contao_run "Wartungsmodus deaktivieren" "${CONSOLE_CMD[@]-}" contao:maintenance-mode disable \
+        || echo "${C_RED}ACHTUNG: Wartungsmodus ist evtl. noch aktiv - manuell: contao:maintenance-mode disable${C_RESET}"
+}
+
 action_migrate_backup() {
+    contao_maint_begin migrate
     contao_run "Migrate mit Backup" "${CONSOLE_CMD[@]-}" contao:migrate
+    contao_maint_end
     contao_pause
 }
 
 action_migrate_nobackup() {
     if contao_yesno "Migrate ohne Backup" "contao:migrate wird OHNE automatisches DB-Backup ausgeführt.\n\nFortfahren?"; then
+        contao_maint_begin migrate
         contao_run "Migrate ohne Backup" "${CONSOLE_CMD[@]-}" contao:migrate --no-backup
+        contao_maint_end
     else
         echo "Abgebrochen."
     fi
@@ -397,11 +461,13 @@ action_migrate_nobackup() {
 }
 
 action_cache_clear() {
+    contao_maint_begin cache
     echo ""
     echo "-> rm -rf var/cache/prod"
     rm -rf "$PROJECT_ROOT/var/cache/prod"
     contao_run "Cache clear" "${CONSOLE_CMD[@]-}" cache:clear --no-warmup
     contao_run "Cache warmup" "${CONSOLE_CMD[@]-}" cache:warmup
+    contao_maint_end
     contao_pause
 }
 
@@ -410,6 +476,7 @@ action_cache_clear() {
 # Symfony-Standard-Parameter --env.
 action_cache_clear_both() {
     local env
+    contao_maint_begin cache
     for env in prod dev; do
         echo ""
         echo "-> rm -rf var/cache/$env"
@@ -417,16 +484,19 @@ action_cache_clear_both() {
         contao_run "Cache clear ($env)" "${CONSOLE_CMD[@]-}" cache:clear --no-warmup --env="$env"
         contao_run "Cache warmup ($env)" "${CONSOLE_CMD[@]-}" cache:warmup --env="$env"
     done
+    contao_maint_end
     contao_pause
 }
 
 action_cache_migrate() {
+    contao_maint_begin migrate
     echo ""
     echo "-> rm -rf var/cache/prod"
     rm -rf "$PROJECT_ROOT/var/cache/prod"
     contao_run "Cache clear" "${CONSOLE_CMD[@]-}" cache:clear --no-warmup
     contao_run "Cache warmup" "${CONSOLE_CMD[@]-}" cache:warmup
     contao_run "Migrate mit Backup" "${CONSOLE_CMD[@]-}" contao:migrate
+    contao_maint_end
     contao_pause
 }
 
@@ -886,8 +956,8 @@ action_env_database() {
     local existing
     existing="$(contao_env_get_value "DATABASE_URL" "$ENV_FILE" 2>/dev/null)"
     if [ -n "$existing" ] && [[ "$existing" =~ ^mysql://([^:@/]*):([^@]*)@([^:/]+):([0-9]+)/(.+)$ ]]; then
-        cur_user="${BASH_REMATCH[1]}"
-        cur_pass="${BASH_REMATCH[2]}"
+        cur_user="$(contao_urldecode "${BASH_REMATCH[1]}")"
+        cur_pass="$(contao_urlencode_if_raw "${BASH_REMATCH[2]}")"
         cur_host="${BASH_REMATCH[3]}"
         cur_port="${BASH_REMATCH[4]}"
         cur_db="${BASH_REMATCH[5]}"
@@ -907,7 +977,14 @@ action_env_database() {
     dbname="$(contao_inputbox "Datenbank" "DB-Name:" "$cur_db")" || { echo "Abgebrochen."; contao_pause; return; }
     user="$(contao_inputbox "Datenbank" "User:" "$cur_user")" || { echo "Abgebrochen."; contao_pause; return; }
     pass="$(contao_passwordbox "Datenbank" "Passwort (leer lassen = bisheriges Passwort behalten):")" || { echo "Abgebrochen."; contao_pause; return; }
-    [ -z "$pass" ] && pass="$cur_pass"
+    # Neu eingegebenes Passwort kodieren (rawurlencode, "/" = %2F); das
+    # bisherige liegt schon kodiert vor und bleibt unverändert.
+    if [ -z "$pass" ]; then
+        pass="$cur_pass"
+    else
+        pass="$(contao_urlencode "$pass")"
+    fi
+    user="$(contao_urlencode "$user")"
 
     local new_url="mysql://${user}:${pass}@${host}:${port}/${dbname}"
     local line="DATABASE_URL=\"$new_url\""
@@ -935,8 +1012,8 @@ action_env_mailer() {
     local existing
     existing="$(contao_env_get_value "MAILER_DSN" "$ENV_FILE" 2>/dev/null)"
     if [ -n "$existing" ] && [[ "$existing" =~ ^smtp://([^:@/]*):([^@]*)@([^:/?]+):([0-9]+)(\?encryption=([a-zA-Z0-9]+))?$ ]]; then
-        cur_user="${BASH_REMATCH[1]}"
-        cur_pass="${BASH_REMATCH[2]}"
+        cur_user="$(contao_urldecode "${BASH_REMATCH[1]}")"
+        cur_pass="$(contao_urlencode_if_raw "${BASH_REMATCH[2]}")"
         cur_host="${BASH_REMATCH[3]}"
         cur_port="${BASH_REMATCH[4]}"
         [ -n "${BASH_REMATCH[6]}" ] && cur_enc="${BASH_REMATCH[6]}"
@@ -955,7 +1032,12 @@ action_env_mailer() {
     port="$(contao_inputbox "Mailer" "SMTP-Port:" "$cur_port")" || { echo "Abgebrochen."; contao_pause; return; }
     user="$(contao_inputbox "Mailer" "Benutzername:" "$cur_user")" || { echo "Abgebrochen."; contao_pause; return; }
     pass="$(contao_passwordbox "Mailer" "Passwort (leer lassen = bisheriges Passwort behalten):")" || { echo "Abgebrochen."; contao_pause; return; }
-    [ -z "$pass" ] && pass="$cur_pass"
+    if [ -z "$pass" ]; then
+        pass="$cur_pass"
+    else
+        pass="$(contao_urlencode "$pass")"
+    fi
+    user="$(contao_urlencode "$user")"
 
     enc_choice="$(contao_menu "Verschlüsselung" "SMTP-Verschlüsselung wählen (aktuell: $cur_enc)" \
         1 "ssl" \
@@ -1008,6 +1090,62 @@ action_env_menu() {
             *) : ;;
         esac
     done
+}
+
+# Datenbankverbindung testen: setzt über die Contao-Console eine einfache
+# Abfrage ab (doctrine:query:sql, sonst dbal:run-sql, sonst contao:migrate
+# --dry-run) und wertet die Fehlermeldung aus. Ändert nichts. Exit-Code 0 =
+# Verbindung ok (relevant für den Parameter-Aufruf "db-test").
+action_db_test() {
+    local sql="SELECT VERSION() AS mysql_version, DATABASE() AS db_name"
+    local cmds out rc=0 dburl
+    echo ""
+    dburl="$(contao_env_get_value "DATABASE_URL" "$ENV_FILE" 2>/dev/null)"
+    if [ -n "$dburl" ]; then
+        echo "DATABASE_URL ($ENV_FILE_REL): $(contao_env_mask_url "$dburl")"
+    elif [ -n "${DATABASE_URL:-}" ]; then
+        echo "DATABASE_URL (Umgebung): $(contao_env_mask_url "$DATABASE_URL")"
+    else
+        echo "${C_ORANGE}Keine DATABASE_URL in $ENV_FILE_REL gefunden (evtl. in .env/.env.local.php oder Server-Umgebung gesetzt).${C_RESET}"
+    fi
+
+    cmds="$("${CONSOLE_CMD[@]-}" list --raw 2>/dev/null)"
+    out="$(mktemp)"
+    echo ""
+    if printf '%s\n' "$cmds" | grep -q '^doctrine:query:sql'; then
+        echo "${C_GREY}-> Ausführen: ${CONSOLE_CMD[*]-} doctrine:query:sql \"$sql\"${C_RESET}"
+        "${CONSOLE_CMD[@]-}" doctrine:query:sql "$sql" >"$out" 2>&1 || rc=$?
+    elif printf '%s\n' "$cmds" | grep -q '^dbal:run-sql'; then
+        echo "${C_GREY}-> Ausführen: ${CONSOLE_CMD[*]-} dbal:run-sql \"$sql\"${C_RESET}"
+        "${CONSOLE_CMD[@]-}" dbal:run-sql "$sql" >"$out" 2>&1 || rc=$?
+    else
+        echo "${C_GREY}-> Ausführen: ${CONSOLE_CMD[*]-} contao:migrate --dry-run --no-backup (kein SQL-Befehl verfügbar)${C_RESET}"
+        "${CONSOLE_CMD[@]-}" contao:migrate --dry-run --no-backup >"$out" 2>&1 || rc=$?
+    fi
+    cat "$out"
+    echo ""
+
+    if [ "$rc" -eq 0 ]; then
+        contao_log "OK: Datenbankverbindung"
+        echo "${C_GREEN}OK: Datenbankverbindung funktioniert.${C_RESET}"
+    else
+        contao_log "FEHLER (Exit $rc): Datenbankverbindung"
+        echo "${C_RED}FEHLER: Datenbankverbindung fehlgeschlagen (Exit $rc).${C_RESET}"
+        if grep -qiE 'Access denied' "$out"; then
+            echo "Hinweis: User/Passwort falsch. Sonderzeichen im Passwort müssen URL-kodiert sein (Menüpunkt 27 erledigt das beim Speichern)."
+        elif grep -qiE 'Unknown database' "$out"; then
+            echo "Hinweis: Die Datenbank existiert nicht - DB-Name in der DATABASE_URL prüfen."
+        elif grep -qiE 'getaddrinfo|Name or service not known|php_network_getaddresses' "$out"; then
+            echo "Hinweis: Host nicht auflösbar - Host in der DATABASE_URL prüfen (localhost vs. 127.0.0.1)."
+        elif grep -qiE 'Connection refused|No such file or directory|2002' "$out"; then
+            echo "Hinweis: Server nicht erreichbar - Host/Port prüfen (MAMP oft 8889, Server meist 3306) und ob MySQL läuft."
+        elif grep -qiE 'str_replace|must be of type' "$out"; then
+            echo "Hinweis: DATABASE_URL ist vermutlich fehlerhaft kodiert (Sonderzeichen im Passwort) - Menüpunkt 27 erneut ausführen."
+        fi
+    fi
+    rm -f "$out"
+    contao_pause
+    return "$rc"
 }
 
 # ----- Datenbank: Backup / Restore / Migrate-Debugging --------------------------
@@ -1139,6 +1277,7 @@ if [ -n "${1:-}" ]; then
         cache-clear-migrate) action_cache_migrate; exit 0 ;;
         backup-create) action_backup_create; exit 0 ;;
         audit) action_composer_audit; exit $? ;;
+        db-test) action_db_test; exit $? ;;
         -h|--help)
             echo "Verfügbare Parameter (führen die Aktion direkt aus, ohne Menü):"
             echo "  cache-clear           Cache leeren"
@@ -1148,12 +1287,13 @@ if [ -n "${1:-}" ]; then
             echo "  cache-clear-migrate   Cache leeren + Migrate"
             echo "  backup-create         Datenbank sichern (contao:backup:create)"
             echo "  audit                 Sicherheitsprüfung (composer audit --locked, Exit 1 bei Treffern)"
+            echo "  db-test               Datenbankverbindung testen (Exit 1 bei Fehler)"
             echo "Ohne Parameter startet das interaktive Menü."
             exit 0
             ;;
         *)
             echo "FEHLER: Unbekannter Parameter '$1'." >&2
-            echo "Verfügbar: cache-clear, cache-clear-all, migrate, migrate-no-backup, cache-clear-migrate, backup-create, audit" >&2
+            echo "Verfügbar: cache-clear, cache-clear-all, migrate, migrate-no-backup, cache-clear-migrate, backup-create, audit, db-test" >&2
             echo "(--help für Details, ohne Parameter startet das interaktive Menü)" >&2
             exit 1
             ;;
@@ -1216,6 +1356,7 @@ while true; do
         25 "Suchindex aufbauen (contao:crawl)" \
         26 "Test-E-Mail versenden (mailer:send)" \
         27 "$ENV_FILE_REL konfigurieren (DATABASE_URL / MAILER_DSN)" \
+        28 "Datenbankverbindung testen [db-test]" \
         0  "Beenden")"
 
     # Leere/ungültige Eingabe (z.B. ESC bei dialog/whiptail, Tippfehler im
@@ -1251,6 +1392,7 @@ while true; do
         25) action_crawl ;;
         26) action_testmail ;;
         27) action_env_menu ;;
+        28) action_db_test || true ;;
         0) break ;;
         *) : ;;
     esac

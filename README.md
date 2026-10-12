@@ -28,6 +28,12 @@ LTS oder 5.7.x LTS, per `composer create-project`).
 - **Erweiterungen** - installieren (Checkbox-Auswahl), Live-Suche auf
   Packagist, entfernen
 - **Werkzeuge** - Filesync, Suchindex, Test-Mail, `.env.local` konfigurieren
+  (Sonderzeichen im DB-Passwort werden URL-kodiert), Datenbankverbindung
+  testen
+
+Cache- und Migrate-Aktionen lassen sich optional in den Wartungsmodus
+einwickeln (`MAINTENANCE_WRAP` in `.contao.conf`: `ask` (Standard), `yes`,
+`no`).
 
 Composer-Aktionen laufen ausschließlich über eine lokale `composer.phar`
 im Projekt-Root (kein Fallback auf ein globales `composer` - das ist auf
@@ -51,13 +57,15 @@ Für Automatisierung/Cron lassen sich einige Aktionen ohne Menü auslösen:
 ./contao.sh cache-clear-migrate   # Cache leeren + Migrate
 ./contao.sh backup-create         # Datenbank sichern (contao:backup:create)
 ./contao.sh audit                 # Sicherheitsprüfung (composer audit --locked)
+./contao.sh db-test               # Datenbankverbindung testen
 ./contao.sh --help                # Übersicht aller Parameter
 ```
 
 Die Kürzel sind fest und unabhängig von der Menü-Nummerierung; im Menü
 stehen sie in eckigen Klammern hinter der jeweiligen Zeile. Ja/Nein-
 Rückfragen entfallen beim Parameter-Aufruf, der Parameter gilt als
-Zustimmung. `audit` liefert bei Treffern Exit-Code 1.
+Zustimmung. `audit` (Treffer) und `db-test` (Verbindungsfehler) liefern
+Exit-Code 1.
 
 ---
 
