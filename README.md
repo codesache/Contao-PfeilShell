@@ -31,6 +31,9 @@ LTS oder 5.7.x LTS, per `composer create-project`).
   (Sonderzeichen im DB-Passwort werden URL-kodiert), Datenbankverbindung
   testen
 
+Nach Composer-Update sowie Installieren/Entfernen von Erweiterungen prüft
+die Shell automatisch auf anstehende Migrationen und bietet Migrate an.
+
 Cache- und Migrate-Aktionen lassen sich optional in den Wartungsmodus
 einwickeln (`MAINTENANCE_WRAP` in `.contao.conf`: `ask` (Standard), `yes`,
 `no`).

@@ -748,7 +748,13 @@ contao_run() {
         local rc=$?
         contao_log "FEHLER (Exit $rc): $desc"
         echo ""
-        echo "${C_RED}!! Befehl ist mit Exit-Code $rc fehlgeschlagen: $desc${C_RESET}" >&2
+        # Optional: CONTAO_RUN_FAIL_TEXT=... contao_run ... ersetzt den
+        # Standardtext (z.B. für Befehle, die bei bewusstem Abbruch Exit 1 liefern).
+        if [ -n "${CONTAO_RUN_FAIL_TEXT:-}" ]; then
+            echo "${C_RED}!! ${CONTAO_RUN_FAIL_TEXT} (Exit-Code $rc): $desc${C_RESET}" >&2
+        else
+            echo "${C_RED}!! Befehl ist mit Exit-Code $rc fehlgeschlagen: $desc${C_RESET}" >&2
+        fi
         return "$rc"
     fi
 }
@@ -759,7 +765,7 @@ contao_confirm_dangerous() {
     local warning="$1"
     echo ""
     echo "${C_RED}!!! VERÄNDERNDE AKTION !!!${C_RESET}"
-    echo "$warning"
+    printf '%b\n' "$warning"
     echo ""
     read -r -p "Zum Bestätigen exakt JA eingeben (alles andere bricht ab): " answer
     [ "$answer" = "JA" ]
@@ -1170,6 +1176,11 @@ contao_checklist_arrows() {
 
     local cur=0 redraw=1 key esc frame first_draw=1 confirm=0
 
+    # Markierte Zeilen grün; bei CONTAO_SH_CHECKLIST_DANGER=1 (z.B. beim
+    # Entfernen von Erweiterungen) rot.
+    local mark_color="$C_GREEN"
+    [ "${CONTAO_SH_CHECKLIST_DANGER:-0}" = "1" ] && mark_color="$C_RED"
+
     printf '\033[?25l' >&2
 
     while true; do
@@ -1196,7 +1207,7 @@ contao_checklist_arrows() {
                 if [ "$cur" -eq "$i" ]; then
                     frame="${frame}${C_SELECT} > ${line}${C_RESET}"$'\n'
                 elif [ "${checked[$i]}" = "1" ]; then
-                    frame="${frame}${C_GREEN}   ${line}${C_RESET}"$'\n'
+                    frame="${frame}${mark_color}   ${line}${C_RESET}"$'\n'
                 else
                     frame="${frame}   ${line}"$'\n'
                 fi

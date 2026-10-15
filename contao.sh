@@ -109,7 +109,7 @@ FRESH_INSTALL_VERSIONS=(
 # jeder Änderung an contao.sh/_contao-lib.sh die PATCH-Stelle hochzählen
 # (1.1.0 -> 1.1.1 -> 1.1.2 ...), bei größeren Feature-Sprüngen die
 # MINOR-Stelle.
-CONTAO_SH_VERSION="1.5.0"
+CONTAO_SH_VERSION="1.7.3"
 TOOL_TITLE="Contao PfeilShell - V${CONTAO_SH_VERSION}"
 
 set -u
@@ -442,17 +442,23 @@ contao_maint_end() {
         || echo "${C_RED}ACHTUNG: Wartungsmodus ist evtl. noch aktiv - manuell: contao:maintenance-mode disable${C_RESET}"
 }
 
-action_migrate_backup() {
+run_migrate_backup() {
     contao_maint_begin migrate
-    contao_run "Migrate mit Backup" "${CONSOLE_CMD[@]-}" contao:migrate
+    CONTAO_RUN_FAIL_TEXT="Migrate wurde abgebrochen oder ist fehlgeschlagen" \
+        contao_run "Migrate mit Backup" "${CONSOLE_CMD[@]-}" contao:migrate
     contao_maint_end
+}
+
+action_migrate_backup() {
+    run_migrate_backup
     contao_pause
 }
 
 action_migrate_nobackup() {
     if contao_yesno "Migrate ohne Backup" "contao:migrate wird OHNE automatisches DB-Backup ausgeführt.\n\nFortfahren?"; then
         contao_maint_begin migrate
-        contao_run "Migrate ohne Backup" "${CONSOLE_CMD[@]-}" contao:migrate --no-backup
+        CONTAO_RUN_FAIL_TEXT="Migrate wurde abgebrochen oder ist fehlgeschlagen" \
+            contao_run "Migrate ohne Backup" "${CONSOLE_CMD[@]-}" contao:migrate --no-backup
         contao_maint_end
     else
         echo "Abgebrochen."
@@ -495,7 +501,8 @@ action_cache_migrate() {
     rm -rf "$PROJECT_ROOT/var/cache/prod"
     contao_run "Cache clear" "${CONSOLE_CMD[@]-}" cache:clear --no-warmup
     contao_run "Cache warmup" "${CONSOLE_CMD[@]-}" cache:warmup
-    contao_run "Migrate mit Backup" "${CONSOLE_CMD[@]-}" contao:migrate
+    CONTAO_RUN_FAIL_TEXT="Migrate wurde abgebrochen oder ist fehlgeschlagen" \
+        contao_run "Migrate mit Backup" "${CONSOLE_CMD[@]-}" contao:migrate
     contao_maint_end
     contao_pause
 }
@@ -641,16 +648,65 @@ action_composer_selfupdate() {
 # und verweist bei Treffern auf den Menüpunkt "Sicherheitsprüfung".
 contao_audit_hint() {
     [ -n "${COMPOSER_CMD+x}" ] && [ "${#COMPOSER_CMD[@]}" -ge 2 ] || return 0
-    if ! "${COMPOSER_CMD[@]}" audit --locked --format=summary >/dev/null 2>&1; then
+    # Exit-Code von composer audit ist eine Bitmaske: 1 = Sicherheitslücken,
+    # 2 = abgekündigte (abandoned) Pakete. Nur Bit 1 ist hier relevant.
+    local rc=0
+    "${COMPOSER_CMD[@]}" audit --locked --format=summary >/dev/null 2>&1 || rc=$?
+    if [ $(( rc & 1 )) -ne 0 ]; then
         echo ""
         echo "${C_ORANGE}HINWEIS: composer audit meldet Sicherheitshinweise für installierte Pakete.${C_RESET}"
         echo "${C_ORANGE}Details: Menüpunkt \"Sicherheitsprüfung (composer audit)\" oder ./contao.sh audit${C_RESET}"
     fi
 }
 
+# Prüft per contao:migrate --dry-run --format=ndjson, ob Migrationen oder
+# Schema-Änderungen anstehen. Die Ausgabe enthält die Zeilen
+#   {"type":"migration-pending","names":[...],...}
+#   {"type":"schema-pending","commands":[...],...}
+# (leere Listen = nichts offen). Rückgabe: 0 = etwas steht an, 1 = nichts
+# offen, 2 = Prüfung nicht möglich (Fehler, z.B. DB nicht erreichbar).
+# Der Exit-Code allein taugt nicht: er ist auch bei offenen Punkten 0.
+contao_migrations_pending() {
+    local out rc=0
+    out="$("${CONSOLE_CMD[@]-}" contao:migrate --dry-run --no-backup --format=ndjson 2>/dev/null)" || rc=$?
+    [ "$rc" -eq 0 ] || return 2
+    printf '%s\n' "$out" | grep -q '"type":"migration-pending"' || return 2
+    printf '%s\n' "$out" | grep -q '"type":"schema-pending"' || return 2
+    if printf '%s\n' "$out" | grep '"type":"migration-pending"' | grep -qv '"names":\[\]'; then
+        return 0
+    fi
+    if printf '%s\n' "$out" | grep '"type":"schema-pending"' | grep -qv '"commands":\[\]'; then
+        return 0
+    fi
+    return 1
+}
+
+# Wird nach Composer-Update/-Require/-Remove aufgerufen: bietet die Migration
+# an, wenn welche ansteht. Im Parameter-Modus nie (dort gibt es keine
+# Nachfrage und es wird nie automatisch migriert).
+contao_offer_migrate() {
+    [ "${CONTAO_SH_CLI_MODE:-0}" = "1" ] && return 0
+    local rc=0
+    echo ""
+    echo "${C_GREY}Prüfe auf anstehende Datenbank-Migrationen ...${C_RESET}"
+    contao_migrations_pending || rc=$?
+    case "$rc" in
+        0)
+            echo "${C_ORANGE}Es stehen Datenbank-Migrationen oder Schema-Änderungen an.${C_RESET}"
+            if contao_yesno "Migrate ausführen?" "Es stehen Migrationen an.\n\nJetzt contao:migrate (mit automatischem Backup) ausführen?"; then
+                run_migrate_backup
+            else
+                echo "Übersprungen - später über den Menüpunkt Migrate ausführen."
+            fi
+            ;;
+        1) echo "${C_GREEN}Keine Migrationen offen.${C_RESET}" ;;
+        *) echo "${C_ORANGE}Prüfung nicht möglich (Datenbank nicht erreichbar oder Fehler) - ggf. Menüpunkt 28 und Migrate-Debugging nutzen.${C_RESET}" ;;
+    esac
+}
+
 action_composer_update_profile() {
     if contao_yesno "Composer Update (Profil)" "composer update --profile ausführen?\n(aktualisiert alle Pakete, zeigt Speicherverbrauch)"; then
-        contao_run "composer update --profile" "${COMPOSER_CMD[@]-}" --profile update && contao_audit_hint
+        contao_run "composer update --profile" "${COMPOSER_CMD[@]-}" --profile update && { contao_audit_hint; contao_offer_migrate; }
     else
         echo "Abgebrochen."
     fi
@@ -664,7 +720,7 @@ action_composer_update_dryrun() {
 
 action_composer_update_all() {
     if contao_yesno "Composer Update" "composer update ausführen?\nAktualisiert ALLE Pakete auf die neuesten kompatiblen Versionen."; then
-        contao_run "composer update" "${COMPOSER_CMD[@]-}" update && contao_audit_hint
+        contao_run "composer update" "${COMPOSER_CMD[@]-}" update && { contao_audit_hint; contao_offer_migrate; }
     else
         echo "Abgebrochen."
     fi
@@ -680,15 +736,20 @@ action_composer_audit() {
     echo ""
     "${COMPOSER_CMD[@]-}" audit --locked || rc=$?
     echo ""
-    if [ "$rc" -eq 0 ]; then
-        contao_log "OK: composer audit (keine Treffer)"
+    # Exit-Code ist eine Bitmaske: 1 = Sicherheitslücken, 2 = abgekündigte Pakete.
+    local vuln=$(( rc & 1 )) abandoned=$(( rc & 2 ))
+    if [ "$vuln" -eq 0 ]; then
+        contao_log "OK: composer audit (keine Sicherheitslücken, Exit $rc)"
         echo "${C_GREEN}OK: Keine bekannten Sicherheitslücken in composer.lock.${C_RESET}"
     else
-        contao_log "composer audit: Treffer/Hinweise (Exit $rc)"
-        echo "${C_ORANGE}Composer meldet Sicherheitshinweise (Exit $rc). Ein Update hilft nur, wenn eine gepatchte Version innerhalb der Constraints der composer.json existiert.${C_RESET}"
+        contao_log "composer audit: Sicherheitslücken (Exit $rc)"
+        echo "${C_ORANGE}Composer meldet Sicherheitslücken. Ein Update hilft nur, wenn eine gepatchte Version innerhalb der Constraints der composer.json existiert.${C_RESET}"
+    fi
+    if [ "$abandoned" -ne 0 ]; then
+        echo "${C_GREY}Hinweis: Abgekündigte (abandoned) Pakete installiert - kein Sicherheitsproblem, aber Ersatz prüfen.${C_RESET}"
     fi
     contao_pause
-    return "$rc"
+    return "$vuln"
 }
 
 # ----- Erweiterungen ------------------------------------------------------------
@@ -716,7 +777,7 @@ action_install_extensions() {
         echo "  - $pkg"
     done
 
-    local run_mode
+    local run_mode do_check=0
     run_mode="$(contao_menu "Vorgehen wählen" "Wie soll installiert werden?" \
         1 "Erst Dry-Run (composer require --dry-run)" \
         2 "Direkt installieren" \
@@ -728,7 +789,7 @@ action_install_extensions() {
             contao_run "composer require --dry-run ($selection)" "${COMPOSER_CMD[@]-}" require --dry-run $selection
             if contao_yesno "Jetzt wirklich installieren?" "Dry-Run abgeschlossen.\n\nJetzt echt installieren (composer require)?"; then
                 # shellcheck disable=SC2086
-                contao_run "composer require ($selection)" "${COMPOSER_CMD[@]-}" require $selection
+                contao_run "composer require ($selection)" "${COMPOSER_CMD[@]-}" require $selection && do_check=1
             else
                 echo "Installation abgebrochen (nur Dry-Run ausgeführt)."
             fi
@@ -736,7 +797,7 @@ action_install_extensions() {
         2)
             if contao_yesno "Installieren bestätigen" "composer require für:\n$selection\n\nwirklich ausführen?"; then
                 # shellcheck disable=SC2086
-                contao_run "composer require ($selection)" "${COMPOSER_CMD[@]-}" require $selection
+                contao_run "composer require ($selection)" "${COMPOSER_CMD[@]-}" require $selection && do_check=1
             else
                 echo "Abgebrochen."
             fi
@@ -756,6 +817,7 @@ action_install_extensions() {
             ;;
     esac
 
+    [ "$do_check" = "1" ] && contao_offer_migrate
     contao_pause
 }
 
@@ -828,7 +890,7 @@ action_extensions_search() {
         echo "  - $pkg"
     done
 
-    local run_mode
+    local run_mode do_check=0
     run_mode="$(contao_menu "Vorgehen wählen" "Wie soll installiert werden?" \
         1 "Erst Dry-Run (composer require --dry-run)" \
         2 "Direkt installieren" \
@@ -840,7 +902,7 @@ action_extensions_search() {
             contao_run "composer require --dry-run ($selection)" "${COMPOSER_CMD[@]-}" require --dry-run $selection
             if contao_yesno "Jetzt wirklich installieren?" "Dry-Run abgeschlossen.\n\nJetzt echt installieren (composer require)?"; then
                 # shellcheck disable=SC2086
-                contao_run "composer require ($selection)" "${COMPOSER_CMD[@]-}" require $selection
+                contao_run "composer require ($selection)" "${COMPOSER_CMD[@]-}" require $selection && do_check=1
             else
                 echo "Installation abgebrochen (nur Dry-Run ausgeführt)."
             fi
@@ -848,7 +910,7 @@ action_extensions_search() {
         2)
             if contao_yesno "Installieren bestätigen" "composer require für:\n$selection\n\nwirklich ausführen?"; then
                 # shellcheck disable=SC2086
-                contao_run "composer require ($selection)" "${COMPOSER_CMD[@]-}" require $selection
+                contao_run "composer require ($selection)" "${COMPOSER_CMD[@]-}" require $selection && do_check=1
             else
                 echo "Abgebrochen."
             fi
@@ -858,6 +920,7 @@ action_extensions_search() {
             ;;
     esac
 
+    [ "$do_check" = "1" ] && contao_offer_migrate
     contao_pause
 }
 
@@ -865,31 +928,59 @@ action_extensions_search() {
 # installiert sind (composer show --name-only), zeigt sie als Checkbox-
 # Auswahl und entfernt die gewählten Pakete per composer remove.
 action_extensions_remove() {
+    # Alle direkt (in composer.json) angeforderten Pakete, nicht nur die aus
+    # EXTENSIONS_LIST - so lässt sich auch z.B. per Packagist-Suche
+    # Installiertes oder ein contao/*-Paket entfernen. Transitive
+    # Abhängigkeiten stehen nicht zur Auswahl (composer remove würde sie
+    # ohnehin nicht entfernen). Format je Zeile: "Name Version Beschreibung".
     local installed_list
-    installed_list="$("${COMPOSER_CMD[@]-}" show --name-only 2>/dev/null)"
+    installed_list="$("${COMPOSER_CMD[@]-}" show --direct --no-ansi 2>/dev/null)"
     if [ -z "$installed_list" ]; then
-        contao_msgbox "Erweiterungen entfernen" "Konnte installierte Pakete nicht ermitteln (composer show fehlgeschlagen)."
+        contao_msgbox "Erweiterungen entfernen" "Konnte installierte Pakete nicht ermitteln (composer show --direct fehlgeschlagen)."
         return
     fi
 
     local checklist_args=() matches=0
-    local entry pkg desc
-    for entry in "${EXTENSIONS_LIST[@]-}"; do
-        pkg="${entry%%|*}"
-        desc="${entry#*|}"
-        if echo "$installed_list" | grep -qx "$pkg"; then
-            checklist_args+=("$pkg" "$desc" "off")
-            matches=$((matches + 1))
+    local line pkg desc known entry
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        # Abandoned-Markierung "!" am Zeilenanfang entfernen
+        line="${line#\! }"
+        pkg="${line%% *}"
+        case "$pkg" in
+            ""|php|php-*|ext-*|lib-*) continue ;;
+        esac
+        # Beschreibung: bekannte aus EXTENSIONS_LIST, sonst die von Composer
+        # (Zeile ohne Name und Version)
+        desc=""
+        for entry in "${EXTENSIONS_LIST[@]-}"; do
+            if [ "${entry%%|*}" = "$pkg" ]; then
+                desc="${entry#*|}"
+                break
+            fi
+        done
+        if [ -z "$desc" ]; then
+            known="${line#* }"
+            known="${known#"${known%%[![:space:]]*}"}"
+            desc="${known#* }"
+            [ "$desc" = "$known" ] && desc=""
+            desc="${desc#"${desc%%[![:space:]]*}"}"
         fi
-    done
+        [ -z "$desc" ] && desc="(keine Beschreibung)"
+        # Paketname vorne, damit in der Auswahl erkennbar ist, was entfernt wird
+        checklist_args+=("$pkg" "$pkg - $desc" "off")
+        matches=$((matches + 1))
+    done <<EOF
+$installed_list
+EOF
 
     if [ "$matches" -eq 0 ]; then
-        contao_msgbox "Erweiterungen entfernen" "Keine der in EXTENSIONS_LIST bekannten Erweiterungen ist aktuell installiert."
+        contao_msgbox "Erweiterungen entfernen" "Keine direkt installierten Pakete gefunden."
         return
     fi
 
     local selection
-    selection="$(contao_checklist "Erweiterungen entfernen" \
+    selection="$(CONTAO_SH_CHECKLIST_DANGER=1 contao_checklist "Erweiterungen entfernen" \
         "Mit Leertaste oder Zifferntaste an-/abwählen, danach \"Fertig\" bestätigen:" "${checklist_args[@]-}")"
     if [ -z "$selection" ]; then
         contao_msgbox "Erweiterungen entfernen" "Keine Auswahl getroffen - nichts entfernt."
@@ -902,9 +993,16 @@ action_extensions_remove() {
         echo "  - $pkg"
     done
 
-    if contao_confirm_dangerous "composer remove wird ausgeführt für:\n$selection\n\nDadurch werden die Dateien der Erweiterung(en) entfernt."; then
+    local core_warn=""
+    case " $selection " in
+        *" contao/core-bundle "*|*" contao/manager-bundle "*|*" contao/manager-plugin "*|*" contao/conflicts "*)
+            core_warn="\n\n${C_RED}ACHTUNG: Die Auswahl enthält Contao-Kernpakete. Das Entfernen macht die Installation unbrauchbar.${C_RESET}"
+            ;;
+    esac
+
+    if contao_confirm_dangerous "composer remove wird ausgeführt für:\n$selection\n\nDadurch werden die Dateien der Erweiterung(en) entfernt.${core_warn}"; then
         # shellcheck disable=SC2086
-        contao_run "composer remove ($selection)" "${COMPOSER_CMD[@]-}" remove $selection
+        contao_run "composer remove ($selection)" "${COMPOSER_CMD[@]-}" remove $selection && contao_offer_migrate
     else
         echo "Abgebrochen."
     fi
