@@ -6,3 +6,6 @@
 # nicht fürs Repo gedacht)
 .contao.conf
 *.log
+
+# Lokale Doku/Notizen
+Doku/

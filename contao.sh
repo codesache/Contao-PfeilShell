@@ -89,6 +89,12 @@ TESTMAIL_TO_DEFAULT="anmich@MEINEDOMAIN.de"
 #   no  = nie
 MAINTENANCE_WRAP="ask"
 
+# Selbst-Update: Quelle der Scripts auf GitHub (raw, nur HTTPS). Die
+# Update-Prüfung läuft nur bei echten Dateien (nicht bei Symlinks) und
+# höchstens einmal pro Tag; in .contao.conf mit UPDATE_CHECK="off" abschaltbar.
+CONTAO_SH_UPDATE_URL="https://raw.githubusercontent.com/codesache/Contao-PfeilShell/main"
+UPDATE_CHECK="daily"
+
 # Dateiname der Umgebungs-Konfiguration relativ zum Projekt-Root
 ENV_FILE_REL=".env.local"
 
@@ -109,7 +115,7 @@ FRESH_INSTALL_VERSIONS=(
 # jeder Änderung an contao.sh/_contao-lib.sh die PATCH-Stelle hochzählen
 # (1.1.0 -> 1.1.1 -> 1.1.2 ...), bei größeren Feature-Sprüngen die
 # MINOR-Stelle.
-CONTAO_SH_VERSION="1.7.3"
+CONTAO_SH_VERSION="1.8.0"
 TOOL_TITLE="Contao PfeilShell - V${CONTAO_SH_VERSION}"
 
 set -u
@@ -1354,6 +1360,134 @@ action_migrate_debug_menu() {
     done
 }
 
+# ----- Selbst-Update von GitHub ---------------------------------------------------
+
+# Nur für echte Dateien (z.B. auf dem Hosting). Ist contao.sh oder
+# _contao-lib.sh ein Symlink (lokaler Mac, Vorlage liegt im Master-Ordner),
+# gibt es weder Prüfung noch Update.
+contao_is_symlinked() {
+    [ -L "${BASH_SOURCE[0]}" ] || [ -L "$LIB_FILE" ]
+}
+
+# Datei per wget/curl holen. $1 = URL, $2 = Zieldatei. Kurzes Timeout, damit
+# ein gesperrter Netzzugriff den Start nicht ausbremst.
+contao_fetch_to() {
+    local url="$1" dest="$2"
+    if command -v wget >/dev/null 2>&1; then
+        wget -q -T 5 -O "$dest" "$url" 2>/dev/null
+    elif command -v curl >/dev/null 2>&1; then
+        curl -fsSL -m 5 -o "$dest" "$url" 2>/dev/null
+    else
+        return 1
+    fi
+    [ -s "$dest" ]
+}
+
+# Liest die Version aus der contao.sh auf GitHub (nur die Versionszeile).
+# Gibt die Version auf stdout aus; Rückgabe 1 bei Fehler.
+contao_remote_version() {
+    local tmp ver
+    tmp="$SCRIPT_DIR/.contao.sh.version"
+    contao_fetch_to "$CONTAO_SH_UPDATE_URL/contao.sh" "$tmp" || { rm -f "$tmp"; return 1; }
+    ver="$(grep -m1 '^CONTAO_SH_VERSION=' "$tmp" | sed -E 's/^CONTAO_SH_VERSION="?([0-9.]+)"?.*/\1/')"
+    rm -f "$tmp"
+    [ -n "$ver" ] || return 1
+    printf '%s' "$ver"
+}
+
+# Versionsvergleich MAJOR.MINOR.PATCH: Rückgabe 0, wenn $1 neuer ist als $2.
+contao_version_gt() {
+    local a="$1" b="$2" i x y
+    for i in 1 2 3; do
+        x="$(printf '%s' "$a" | cut -d. -f"$i")"; x="${x:-0}"
+        y="$(printf '%s' "$b" | cut -d. -f"$i")"; y="${y:-0}"
+        [ "$x" -gt "$y" ] 2>/dev/null && return 0
+        [ "$x" -lt "$y" ] 2>/dev/null && return 1
+    done
+    return 1
+}
+
+# Beim Start: höchstens einmal pro Tag (und nur bei echten Dateien) die
+# GitHub-Version prüfen. Zeitpunkt und gefundene Version stehen in der
+# .contao.conf, so kostet jeder weitere Start keinen Netzzugriff. Ist eine
+# neuere Version bekannt, erscheint eine Zeile im Menü.
+contao_update_check() {
+    [ "${UPDATE_CHECK:-daily}" = "off" ] && return 0
+    contao_is_symlinked && return 0
+
+    local now last remote
+    now="$(date +%s)"
+    last="${CONTAO_SH_UPDATE_LAST_CHECK:-0}"
+    if [ $(( now - last )) -ge 86400 ]; then
+        remote="$(contao_remote_version)" || remote=""
+        CONTAO_SH_UPDATE_LAST_CHECK="$now"
+        contao_env_set_value "CONTAO_SH_UPDATE_LAST_CHECK" "CONTAO_SH_UPDATE_LAST_CHECK=\"$now\"" "$CONTAO_CONF_FILE" no_backup
+        if [ -n "$remote" ]; then
+            CONTAO_SH_UPDATE_REMOTE_VERSION="$remote"
+            contao_env_set_value "CONTAO_SH_UPDATE_REMOTE_VERSION" "CONTAO_SH_UPDATE_REMOTE_VERSION=\"$remote\"" "$CONTAO_CONF_FILE" no_backup
+        fi
+    fi
+
+    remote="${CONTAO_SH_UPDATE_REMOTE_VERSION:-}"
+    if [ -n "$remote" ] && contao_version_gt "$remote" "$CONTAO_SH_VERSION"; then
+        CONTAO_SH_PATH_LINE="${CONTAO_SH_PATH_LINE}"$'\n'"${C_ORANGE}Update verfügbar: V${remote} (installiert: V${CONTAO_SH_VERSION}) - Menüpunkt \"Script aktualisieren\"${C_RESET}"
+    fi
+}
+
+action_self_update() {
+    if contao_is_symlinked; then
+        echo ""
+        echo "contao.sh bzw. _contao-lib.sh ist ein Symlink (lokale Entwicklungsvorlage)."
+        echo "Ein Update von GitHub ist hier nicht vorgesehen - die Dateien werden im Master-Ordner gepflegt."
+        contao_pause
+        return
+    fi
+    if [ ! -w "$SCRIPT_DIR" ]; then
+        echo ""
+        echo "${C_RED}FEHLER: Keine Schreibrechte in $SCRIPT_DIR - Update nicht möglich.${C_RESET}"
+        contao_pause
+        return
+    fi
+
+    echo ""
+    echo "Prüfe GitHub (${CONTAO_SH_UPDATE_URL}) ..."
+    local remote
+    remote="$(contao_remote_version)" || remote=""
+    if [ -z "$remote" ]; then
+        echo "${C_RED}FEHLER: GitHub nicht erreichbar (kein Netzzugriff oder wget/curl fehlt).${C_RESET}"
+        contao_pause
+        return
+    fi
+
+    if ! contao_yesno "Script aktualisieren" "Installiert: V${CONTAO_SH_VERSION}\nAuf GitHub: V${remote}\n\ncontao.sh und _contao-lib.sh jetzt durch die GitHub-Version ersetzen?\n(.contao.conf bleibt unverändert.)"; then
+        echo "Abgebrochen."
+        contao_pause
+        return
+    fi
+
+    # Download als Dateien neben den Scripts (kein Ordner, kein /tmp nötig).
+    local new_main="$SCRIPT_DIR/contao.sh.new" new_lib="$SCRIPT_DIR/_contao-lib.sh.new"
+    if ! contao_fetch_to "$CONTAO_SH_UPDATE_URL/contao.sh" "$new_main" \
+        || ! contao_fetch_to "$CONTAO_SH_UPDATE_URL/_contao-lib.sh" "$new_lib"; then
+        rm -f "$new_main" "$new_lib"
+        echo "${C_RED}FEHLER: Download fehlgeschlagen - nichts geändert.${C_RESET}"
+        contao_pause
+        return
+    fi
+
+    chmod +x "$new_main" 2>/dev/null
+    if mv -f "$new_lib" "$LIB_FILE" && mv -f "$new_main" "${BASH_SOURCE[0]}"; then
+        contao_log "Selbst-Update: V${CONTAO_SH_VERSION} -> V${remote}"
+        contao_env_set_value "CONTAO_SH_UPDATE_REMOTE_VERSION" "CONTAO_SH_UPDATE_REMOTE_VERSION=\"$remote\"" "$CONTAO_CONF_FILE" no_backup
+        echo "${C_GREEN}OK: Aktualisiert auf V${remote} - starte neu ...${C_RESET}"
+        sleep 1
+        exec bash "${BASH_SOURCE[0]}"
+    fi
+    rm -f "$new_main" "$new_lib"
+    echo "${C_RED}FEHLER: Dateien konnten nicht ersetzt werden.${C_RESET}"
+    contao_pause
+}
+
 # ----- Direkter Aufruf per Kommandozeilen-Parameter --------------------------
 
 # Für Automatisierung/Cron: eine bewusst kleine Auswahl unkritischer
@@ -1409,6 +1543,8 @@ CONTAO_SH_PATH_LINE="Pfad: $PROJECT_ROOT"
 # Statuszeile (PHP/Composer-Segment-Balken) einmalig pro Skriptlauf bauen,
 # nicht bei jedem Menü-Redraw (siehe contao_build_status_line).
 contao_build_status_line
+# Update-Hinweis (nur bei echten Dateien, höchstens einmal pro Tag Netzzugriff).
+contao_update_check
 MAIN_MENU_INTRO_FULL="Deine pfeilschnelle Kommandozentrale für Update, Installation, Migration, Cache und viele weitere Helferchen."
 MAIN_MENU_INTRO_SHORT=""
 main_menu_shown=0
@@ -1455,6 +1591,7 @@ while true; do
         26 "Test-E-Mail versenden (mailer:send)" \
         27 "$ENV_FILE_REL konfigurieren (DATABASE_URL / MAILER_DSN)" \
         28 "Datenbankverbindung testen [db-test]" \
+        29 "Script aktualisieren (GitHub)" \
         0  "Beenden")"
 
     # Leere/ungültige Eingabe (z.B. ESC bei dialog/whiptail, Tippfehler im
@@ -1491,6 +1628,7 @@ while true; do
         26) action_testmail ;;
         27) action_env_menu ;;
         28) action_db_test || true ;;
+        29) action_self_update ;;
         0) break ;;
         *) : ;;
     esac

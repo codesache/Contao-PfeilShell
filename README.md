@@ -31,6 +31,11 @@ LTS oder 5.7.x LTS, per `composer create-project`).
   (Sonderzeichen im DB-Passwort werden URL-kodiert), Datenbankverbindung
   testen
 
+Auf dem Hosting (echte Dateien, kein Symlink) prüft `contao.sh` höchstens
+einmal pro Tag, ob auf GitHub eine neuere Version liegt, und aktualisiert
+sich über den Menüpunkt "Script aktualisieren". Abschaltbar mit
+`UPDATE_CHECK="off"` in `.contao.conf`.
+
 Nach Composer-Update sowie Installieren/Entfernen von Erweiterungen prüft
 die Shell automatisch auf anstehende Migrationen und bietet Migrate an.
 
