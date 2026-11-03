@@ -115,7 +115,7 @@ FRESH_INSTALL_VERSIONS=(
 # jeder Änderung an contao.sh/_contao-lib.sh die PATCH-Stelle hochzählen
 # (1.1.0 -> 1.1.1 -> 1.1.2 ...), bei größeren Feature-Sprüngen die
 # MINOR-Stelle.
-CONTAO_SH_VERSION="1.8.1"
+CONTAO_SH_VERSION="1.10.1"
 TOOL_TITLE="Contao PfeilShell - V${CONTAO_SH_VERSION}"
 
 set -u
@@ -706,13 +706,76 @@ contao_offer_migrate() {
             fi
             ;;
         1) echo "${C_GREEN}Keine Migrationen offen.${C_RESET}" ;;
-        *) echo "${C_ORANGE}Prüfung nicht möglich (Datenbank nicht erreichbar oder Fehler) - ggf. Menüpunkt 28 und Migrate-Debugging nutzen.${C_RESET}" ;;
+        *) echo "${C_ORANGE}Prüfung nicht möglich (Datenbank nicht erreichbar oder Fehler) - ggf. Menüpunkt 30 und Migrate-Debugging nutzen.${C_RESET}" ;;
     esac
+}
+
+# Wie contao_run, aber für composer update/require: die Ausgabe wird
+# mitgeschnitten, damit bei einem Fehlschlag wegen gesperrter Pakete mit
+# bekannten Sicherheitslücken ("affected by security advisories", typisch bei
+# Contao 4.13 mit neuem Composer) ein konkreter Lösungshinweis erscheint.
+contao_run_composer() {
+    local desc="$1" out rc=0
+    shift
+    out="$(mktemp)"
+    echo ""
+    echo "${C_GREY}-> Ausführen: $*${C_RESET}"
+    echo ""
+    "$@" 2>&1 | tee "$out"
+    rc="${PIPESTATUS[0]}"
+    if [ "$rc" -eq 0 ]; then
+        contao_log "OK: $desc"
+        echo "${C_GREEN}OK: $desc${C_RESET}"
+        rm -f "$out"
+        return 0
+    fi
+    contao_log "FEHLER (Exit $rc): $desc"
+    echo ""
+    echo "${C_RED}!! Befehl ist mit Exit-Code $rc fehlgeschlagen: $desc${C_RESET}" >&2
+    if grep -q 'affected by security advisories' "$out" 2>/dev/null; then
+        echo ""
+        echo "${C_ORANGE}HINWEIS: Composer sperrt Pakete mit bekannten Sicherheitslücken (typisch bei Contao 4.13).${C_RESET}"
+        echo "${C_ORANGE} - Umzug/frisches Verzeichnis mit vorhandener composer.lock: Menüpunkt \"Composer Install (aus composer.lock)\".${C_RESET}"
+        echo "${C_ORANGE} - Sonst: Menüpunkt \"Composer Update ohne Sicherheitssperre\" (--no-security-blocking).${C_RESET}"
+        echo "${C_ORANGE}Die Lücken bleiben dabei bestehen - langfristig auf Contao 5 upgraden.${C_RESET}"
+    fi
+    rm -f "$out"
+    return "$rc"
+}
+
+# Composer Install aus der composer.lock: installiert exakt die dort
+# festgehaltenen Versionen (z.B. beim Umzug auf ein anderes Hosting).
+action_composer_install() {
+    if [ ! -f "$PROJECT_ROOT/composer.lock" ]; then
+        echo ""
+        echo "${C_RED}Keine composer.lock in $PROJECT_ROOT gefunden.${C_RESET}"
+        echo "Für einen Umzug composer.json und composer.lock vom alten Server in dieses Verzeichnis kopieren."
+        contao_pause
+        return
+    fi
+    if contao_yesno "Composer Install" "composer install ausführen?\nInstalliert exakt die Versionen aus der composer.lock (z.B. nach einem Umzug)."; then
+        contao_run "composer install" "${COMPOSER_CMD[@]-}" install && { contao_audit_hint; contao_offer_migrate; }
+    else
+        echo "Abgebrochen."
+    fi
+    contao_pause
+}
+
+# Update ohne Sperre für Pakete mit bekannten Sicherheitslücken. Nötig bei
+# nicht mehr gepflegten Zweigen wie Contao 4.13, für die es keine unbetroffene
+# Version mehr gibt.
+action_composer_update_nosec() {
+    if contao_yesno "Update ohne Sicherheitssperre" "composer update --no-security-blocking ausführen?\n\nPakete mit bekannten Sicherheitslücken werden NICHT gesperrt. Nur für Projekte, die nicht anders aktualisierbar sind (z.B. Contao 4.13).\nDie Lücken bleiben bestehen."; then
+        contao_run_composer "composer update --no-security-blocking" "${COMPOSER_CMD[@]-}" update --no-security-blocking && { contao_audit_hint; contao_offer_migrate; }
+    else
+        echo "Abgebrochen."
+    fi
+    contao_pause
 }
 
 action_composer_update_profile() {
     if contao_yesno "Composer Update (Profil)" "composer update --profile ausführen?\n(aktualisiert alle Pakete, zeigt Speicherverbrauch)"; then
-        contao_run "composer update --profile" "${COMPOSER_CMD[@]-}" --profile update && { contao_audit_hint; contao_offer_migrate; }
+        contao_run_composer "composer update --profile" "${COMPOSER_CMD[@]-}" --profile update && { contao_audit_hint; contao_offer_migrate; }
     else
         echo "Abgebrochen."
     fi
@@ -726,7 +789,7 @@ action_composer_update_dryrun() {
 
 action_composer_update_all() {
     if contao_yesno "Composer Update" "composer update ausführen?\nAktualisiert ALLE Pakete auf die neuesten kompatiblen Versionen."; then
-        contao_run "composer update" "${COMPOSER_CMD[@]-}" update && { contao_audit_hint; contao_offer_migrate; }
+        contao_run_composer "composer update" "${COMPOSER_CMD[@]-}" update && { contao_audit_hint; contao_offer_migrate; }
     else
         echo "Abgebrochen."
     fi
@@ -795,7 +858,7 @@ action_install_extensions() {
             contao_run "composer require --dry-run ($selection)" "${COMPOSER_CMD[@]-}" require --dry-run $selection
             if contao_yesno "Jetzt wirklich installieren?" "Dry-Run abgeschlossen.\n\nJetzt echt installieren (composer require)?"; then
                 # shellcheck disable=SC2086
-                contao_run "composer require ($selection)" "${COMPOSER_CMD[@]-}" require $selection && do_check=1
+                contao_run_composer "composer require ($selection)" "${COMPOSER_CMD[@]-}" require $selection && do_check=1
             else
                 echo "Installation abgebrochen (nur Dry-Run ausgeführt)."
             fi
@@ -803,7 +866,7 @@ action_install_extensions() {
         2)
             if contao_yesno "Installieren bestätigen" "composer require für:\n$selection\n\nwirklich ausführen?"; then
                 # shellcheck disable=SC2086
-                contao_run "composer require ($selection)" "${COMPOSER_CMD[@]-}" require $selection && do_check=1
+                contao_run_composer "composer require ($selection)" "${COMPOSER_CMD[@]-}" require $selection && do_check=1
             else
                 echo "Abgebrochen."
             fi
@@ -908,7 +971,7 @@ action_extensions_search() {
             contao_run "composer require --dry-run ($selection)" "${COMPOSER_CMD[@]-}" require --dry-run $selection
             if contao_yesno "Jetzt wirklich installieren?" "Dry-Run abgeschlossen.\n\nJetzt echt installieren (composer require)?"; then
                 # shellcheck disable=SC2086
-                contao_run "composer require ($selection)" "${COMPOSER_CMD[@]-}" require $selection && do_check=1
+                contao_run_composer "composer require ($selection)" "${COMPOSER_CMD[@]-}" require $selection && do_check=1
             else
                 echo "Installation abgebrochen (nur Dry-Run ausgeführt)."
             fi
@@ -916,7 +979,7 @@ action_extensions_search() {
         2)
             if contao_yesno "Installieren bestätigen" "composer require für:\n$selection\n\nwirklich ausführen?"; then
                 # shellcheck disable=SC2086
-                contao_run "composer require ($selection)" "${COMPOSER_CMD[@]-}" require $selection && do_check=1
+                contao_run_composer "composer require ($selection)" "${COMPOSER_CMD[@]-}" require $selection && do_check=1
             else
                 echo "Abgebrochen."
             fi
@@ -1223,7 +1286,7 @@ action_db_test() {
         echo "${C_GREY}-> Ausführen: ${CONSOLE_CMD[*]-} dbal:run-sql \"$sql\"${C_RESET}"
         "${CONSOLE_CMD[@]-}" dbal:run-sql "$sql" >"$out" 2>&1 || rc=$?
     else
-        echo "${C_GREY}-> Ausführen: ${CONSOLE_CMD[*]-} contao:migrate --dry-run --no-backup (kein SQL-Befehl verfügbar)${C_RESET}"
+        echo "${C_GREY}-> Ausführen: ${CONSOLE_CMD[*]-} contao:migrate --dry-run --no-backup (Befehlsliste nicht lesbar oder kein SQL-Befehl verfügbar)${C_RESET}"
         "${CONSOLE_CMD[@]-}" contao:migrate --dry-run --no-backup >"$out" 2>&1 || rc=$?
     fi
     cat "$out"
@@ -1235,8 +1298,11 @@ action_db_test() {
     else
         contao_log "FEHLER (Exit $rc): Datenbankverbindung"
         echo "${C_RED}FEHLER: Datenbankverbindung fehlgeschlagen (Exit $rc).${C_RESET}"
-        if grep -qiE 'Access denied' "$out"; then
-            echo "Hinweis: User/Passwort falsch. Sonderzeichen im Passwort müssen URL-kodiert sein (Menüpunkt 27 erledigt das beim Speichern)."
+        if grep -q 'Composer detected issues in your platform' "$out"; then
+            echo "Hinweis: Das verwendete PHP (${PHP_BIN:-?}) ist für die installierten Pakete zu alt oder passt nicht (Composer-Plattformprüfung) - die Console startet nicht, mit der Datenbank hat das nichts zu tun."
+            echo "         Menüpunkt 2 (PHP-Version wählen): eine PHP-Version wählen, die die oben genannte Anforderung erfüllt."
+        elif grep -qiE 'Access denied' "$out"; then
+            echo "Hinweis: User/Passwort falsch. Sonderzeichen im Passwort müssen URL-kodiert sein (Menüpunkt 29 erledigt das beim Speichern)."
         elif grep -qiE 'Unknown database' "$out"; then
             echo "Hinweis: Die Datenbank existiert nicht - DB-Name in der DATABASE_URL prüfen."
         elif grep -qiE 'getaddrinfo|Name or service not known|php_network_getaddresses' "$out"; then
@@ -1244,7 +1310,7 @@ action_db_test() {
         elif grep -qiE 'Connection refused|No such file or directory|2002' "$out"; then
             echo "Hinweis: Server nicht erreichbar - Host/Port prüfen (MAMP oft 8889, Server meist 3306) und ob MySQL läuft."
         elif grep -qiE 'str_replace|must be of type' "$out"; then
-            echo "Hinweis: DATABASE_URL ist vermutlich fehlerhaft kodiert (Sonderzeichen im Passwort) - Menüpunkt 27 erneut ausführen."
+            echo "Hinweis: DATABASE_URL ist vermutlich fehlerhaft kodiert (Sonderzeichen im Passwort) - Menüpunkt 29 erneut ausführen."
         fi
     fi
     rm -f "$out"
@@ -1570,28 +1636,30 @@ while true; do
         9  "Composer Update (Dry-Run / Testlauf)" \
         10 "Composer Update (alle Pakete aktualisieren)" \
         11 "Sicherheitsprüfung (composer audit) [audit]" \
+        12 "Composer Install (aus composer.lock, z.B. nach Umzug)" \
+        13 "Composer Update ohne Sicherheitssperre (--no-security-blocking)" \
         "#" "Cache" \
-        12 "Cache leeren [cache-clear]" \
-        13 "Cache leeren (prod + dev) [cache-clear-all]" \
+        14 "Cache leeren [cache-clear]" \
+        15 "Cache leeren (prod + dev) [cache-clear-all]" \
         "#" "Datenbank + Migration" \
-        14 "Migrate (mit automatischem Backup) [migrate]" \
-        15 "Migrate ohne Backup [migrate-no-backup]" \
-        16 "Cache leeren + Migrate [cache-clear-migrate]" \
-        17 "Datenbank sichern (contao:backup:create) [backup-create]" \
-        18 "Vorhandene Backups auflisten (contao:backup:list)" \
-        19 "Datenbank aus Backup wiederherstellen (contao:backup:restore)" \
-        20 "Migrate-Debugging (Dry-Run-Varianten)" \
+        16 "Migrate (mit automatischem Backup) [migrate]" \
+        17 "Migrate ohne Backup [migrate-no-backup]" \
+        18 "Cache leeren + Migrate [cache-clear-migrate]" \
+        19 "Datenbank sichern (contao:backup:create) [backup-create]" \
+        20 "Vorhandene Backups auflisten (contao:backup:list)" \
+        21 "Datenbank aus Backup wiederherstellen (contao:backup:restore)" \
+        22 "Migrate-Debugging (Dry-Run-Varianten)" \
         "#" "Erweiterungen" \
-        21 "Erweiterungen installieren (Checkbox-Auswahl)" \
-        22 "Erweiterungen suchen (Packagist)" \
-        23 "Erweiterungen entfernen (composer remove)" \
+        23 "Erweiterungen installieren (Checkbox-Auswahl)" \
+        24 "Erweiterungen suchen (Packagist)" \
+        25 "Erweiterungen entfernen (composer remove)" \
         "#" "Werkzeuge" \
-        24 "Dateiverwaltung abgleichen (contao:filesync)" \
-        25 "Suchindex aufbauen (contao:crawl)" \
-        26 "Test-E-Mail versenden (mailer:send)" \
-        27 "$ENV_FILE_REL konfigurieren (DATABASE_URL / MAILER_DSN)" \
-        28 "Datenbankverbindung testen [db-test]" \
-        29 "Script aktualisieren (GitHub)" \
+        26 "Dateiverwaltung abgleichen (contao:filesync)" \
+        27 "Suchindex aufbauen (contao:crawl)" \
+        28 "Test-E-Mail versenden (mailer:send)" \
+        29 "$ENV_FILE_REL konfigurieren (DATABASE_URL / MAILER_DSN)" \
+        30 "Datenbankverbindung testen [db-test]" \
+        31 "Script aktualisieren (GitHub)" \
         0  "Beenden")"
 
     # Leere/ungültige Eingabe (z.B. ESC bei dialog/whiptail, Tippfehler im
@@ -1611,24 +1679,26 @@ while true; do
         9) action_composer_update_dryrun ;;
         10) action_composer_update_all ;;
         11) action_composer_audit || true ;;
-        12) action_cache_clear ;;
-        13) action_cache_clear_both ;;
-        14) action_migrate_backup ;;
-        15) action_migrate_nobackup ;;
-        16) action_cache_migrate ;;
-        17) action_backup_create ;;
-        18) action_backup_list ;;
-        19) action_backup_restore ;;
-        20) action_migrate_debug_menu ;;
-        21) action_install_extensions ;;
-        22) action_extensions_search ;;
-        23) action_extensions_remove ;;
-        24) action_filesync ;;
-        25) action_crawl ;;
-        26) action_testmail ;;
-        27) action_env_menu ;;
-        28) action_db_test || true ;;
-        29) action_self_update ;;
+        12) action_composer_install ;;
+        13) action_composer_update_nosec ;;
+        14) action_cache_clear ;;
+        15) action_cache_clear_both ;;
+        16) action_migrate_backup ;;
+        17) action_migrate_nobackup ;;
+        18) action_cache_migrate ;;
+        19) action_backup_create ;;
+        20) action_backup_list ;;
+        21) action_backup_restore ;;
+        22) action_migrate_debug_menu ;;
+        23) action_install_extensions ;;
+        24) action_extensions_search ;;
+        25) action_extensions_remove ;;
+        26) action_filesync ;;
+        27) action_crawl ;;
+        28) action_testmail ;;
+        29) action_env_menu ;;
+        30) action_db_test || true ;;
+        31) action_self_update ;;
         0) break ;;
         *) : ;;
     esac

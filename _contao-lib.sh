@@ -181,6 +181,32 @@ _contao_php_ver_to_num() {
 # als Duplikat erkannt werden statt doppelt in der Auswahl aufzutauchen.
 # Fällt auf den unveränderten Pfad zurück, falls weder realpath noch
 # readlink -f verfügbar sind.
+# Prüft, ob ein PHP-Binary das CLI-SAPI ist. Auf manchen Hostern (z.B. IONOS)
+# ist "php8.4" die CGI-Variante: sie kennt "-r" nicht, gibt stattdessen die
+# Usage-Hilfe aus und lässt Composer mit "cannot be run safely on non-CLI
+# SAPIs" abbrechen. Die CLI-Variante heißt dort "php8.4-cli".
+_contao_php_is_cli() {
+    local out
+    out="$("$1" -r 'echo PHP_SAPI;' 2>/dev/null </dev/null | head -c 20)"
+    [ "$out" = "cli" ]
+}
+
+# Liefert zu einem PHP-Binary den CLI-Pfad auf stdout: das Binary selbst,
+# falls es CLI ist, sonst "<Binary>-cli", falls vorhanden. Rückgabe 1, wenn
+# keine CLI-Variante gefunden wird.
+_contao_php_to_cli() {
+    local c="$1"
+    if _contao_php_is_cli "$c"; then
+        printf '%s' "$c"
+        return 0
+    fi
+    if [ -x "${c}-cli" ] && _contao_php_is_cli "${c}-cli"; then
+        printf '%s' "${c}-cli"
+        return 0
+    fi
+    return 1
+}
+
 _contao_php_canon_path() {
     local p="$1"
     if command -v realpath >/dev/null 2>&1; then
@@ -231,7 +257,7 @@ contao_collect_php_candidates() {
                     continue
                     ;;
             esac
-            if [[ "$name" =~ ^php[0-9]+(\.[0-9]+)?$ ]]; then
+            if [[ "$name" =~ ^php[0-9]+(\.[0-9]+)?(-cli)?$ ]]; then
                 raw_candidates+=("$cand")
             fi
         done
@@ -262,6 +288,10 @@ contao_collect_php_candidates() {
     local -a seen_canons=()
     for c in "${raw_candidates[@]-}"; do
         [ -x "$c" ] || continue
+        # Nur CLI-Binaries zulassen; eine CGI-Variante wird durch ihr
+        # "-cli"-Pendant ersetzt (z.B. IONOS: php8.4 -> php8.4-cli), sonst
+        # verworfen.
+        c="$(_contao_php_to_cli "$c")" || continue
         canon="$(_contao_php_canon_path "$c")"
         [ -z "$canon" ] && canon="$c"
         already=0
@@ -298,17 +328,25 @@ contao_collect_php_candidates() {
 PHP_BIN=""
 
 contao_resolve_php() {
+    local cli_bin
     if [ -n "${PHP_BIN_OVERRIDE:-}" ] && [ -x "$PHP_BIN_OVERRIDE" ]; then
-        PHP_BIN="$PHP_BIN_OVERRIDE"
-        return 0
+        if cli_bin="$(_contao_php_to_cli "$PHP_BIN_OVERRIDE")"; then
+            PHP_BIN="$cli_bin"
+            return 0
+        fi
     fi
 
     # PHP_BIN_SELECTED kommt - falls vorhanden - direkt aus .contao.conf,
     # das contao.sh bereits per 'source' eingebunden hat, bevor diese
     # Funktion aufgerufen wird (siehe CONTAO_CONF_FILE-Handling in contao.sh).
+    # Eine gespeicherte Nicht-CLI-Variante (z.B. php8.4 = CGI bei IONOS) wird
+    # auf ihr "-cli"-Pendant umgebogen; gibt es keins, greift die automatische
+    # Erkennung.
     if [ -n "${PHP_BIN_SELECTED:-}" ] && [ -x "$PHP_BIN_SELECTED" ]; then
-        PHP_BIN="$PHP_BIN_SELECTED"
-        return 0
+        if cli_bin="$(_contao_php_to_cli "$PHP_BIN_SELECTED")"; then
+            PHP_BIN="$cli_bin"
+            return 0
+        fi
     fi
 
     contao_collect_php_candidates || return 1
@@ -351,7 +389,7 @@ contao_resolve_php() {
 # bundle-Version direkt aus composer.lock - bewusst ohne Composer-Aufruf
 # (kein Bootstrap-Overhead), damit das bei jedem Start unbedenklich läuft.
 # ---------------------------------------------------------------------------
-contao_detect_contao_branch() {
+contao_detect_contao_version() {
     local dir="$1" lock_file version
     lock_file="$dir/composer.lock"
     [ -f "$lock_file" ] || return 1
@@ -359,6 +397,13 @@ contao_detect_contao_branch() {
         | grep -m1 '"version"' \
         | sed -E 's/.*"version": *"v?([^"]+)".*/\1/')"
     [ -z "$version" ] && return 1
+    echo "$version"
+    return 0
+}
+
+contao_detect_contao_branch() {
+    local version
+    version="$(contao_detect_contao_version "$1")" || return 1
     echo "$version" | cut -d. -f1,2
     return 0
 }
@@ -375,6 +420,18 @@ contao_detect_contao_branch() {
 CONTAO_SH_PHP_COMPAT_STATUS="unknown"
 CONTAO_SH_PHP_COMPAT_MSG=""
 
+# Liest die von Composer erzeugte vendor/composer/platform_check.php und gibt
+# die dort geforderte minimale PHP_VERSION_ID aus (z.B. 80300 für "PHP >= 8.3").
+# Das ist die Grenze, ab der die Console überhaupt startet - unabhängig vom
+# Contao-Zweig. Rückgabe 1, wenn die Datei fehlt oder nichts enthält.
+contao_platform_php_min() {
+    local file="$1/vendor/composer/platform_check.php" id
+    [ -f "$file" ] || return 1
+    id="$(grep -m1 -oE 'PHP_VERSION_ID >= [0-9]+' "$file" 2>/dev/null | grep -oE '[0-9]+$')"
+    [ -n "$id" ] || return 1
+    printf '%s' "$id"
+}
+
 contao_php_compat_check() {
     local dir="$1" branch entry e_branch e_min e_max
     local php_ver php_num min_num max_num
@@ -383,6 +440,23 @@ contao_php_compat_check() {
     CONTAO_SH_PHP_COMPAT_MSG=""
 
     [ -n "${PHP_BIN:-}" ] && [ -x "$PHP_BIN" ] || return 1
+
+    # Zuerst die Plattformprüfung von Composer: ist das gewählte PHP älter als
+    # das, was die installierten Pakete verlangen, startet die Console nicht
+    # ("Composer detected issues in your platform"). Gilt für jeden Contao-Zweig,
+    # auch solche ohne Eintrag in CONTAO_PHP_COMPAT (z.B. 4.13).
+    local pf_min pf_cur pf_ver
+    if pf_min="$(contao_platform_php_min "$dir")"; then
+        pf_cur="$("$PHP_BIN" -r 'echo PHP_VERSION_ID;' 2>/dev/null)"
+        if [ -n "$pf_cur" ] && [ "$pf_cur" -lt "$pf_min" ] 2>/dev/null; then
+            pf_ver="$(( pf_min / 10000 )).$(( pf_min / 100 % 100 )).$(( pf_min % 100 ))"
+            php_ver="$("$PHP_BIN" -r 'echo PHP_VERSION;' 2>/dev/null)"
+            CONTAO_SH_PHP_COMPAT_STATUS="low"
+            CONTAO_SH_PHP_COMPAT_MSG="PHP ${php_ver:-?} ist für die installierten Pakete zu alt (Composer-Plattformprüfung verlangt >= ${pf_ver}) - die Console startet so nicht. Mit Menüpunkt 2 (PHP-Version wählen) eine neuere Version wählen."
+            return 0
+        fi
+    fi
+
     branch="$(contao_detect_contao_branch "$dir")" || return 1
     [ -z "$branch" ] && return 1
 
@@ -501,7 +575,14 @@ contao_build_status_line() {
         fi
     fi
 
-    CONTAO_SH_STATUS_LINE="${php_col} PHP ${php_ver:-?} ${C_RESET}${mem_col} mem ${mem_limit:-?} ${C_RESET}${exec_col} exec ${max_exec:-?}s ${C_RESET}${vars_col} vars ${max_vars:-?} ${C_RESET}${C_BG_GREY} Composer ${composer_ver:-?} ${C_RESET}"
+    # Contao-Version (aus composer.lock, ohne Composer-Aufruf); Segment entfällt,
+    # wenn sie nicht ermittelbar ist (z.B. noch keine Installation).
+    local contao_seg="" contao_ver
+    if contao_ver="$(contao_detect_contao_version "${PROJECT_ROOT:-.}")" && [ -n "$contao_ver" ]; then
+        contao_seg="${C_BG_GREY} Contao ${contao_ver} ${C_RESET}"
+    fi
+
+    CONTAO_SH_STATUS_LINE="${contao_seg}${php_col} PHP ${php_ver:-?} ${C_RESET}${mem_col} mem ${mem_limit:-?} ${C_RESET}${exec_col} exec ${max_exec:-?}s ${C_RESET}${vars_col} vars ${max_vars:-?} ${C_RESET}${C_BG_GREY} Composer ${composer_ver:-?} ${C_RESET}"
     return 0
 }
 

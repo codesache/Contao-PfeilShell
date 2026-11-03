@@ -21,7 +21,8 @@ LTS oder 5.7.x LTS, per `composer create-project`).
 - **System** - PHP-Info, PHP-Version wählen
 - **Composer** - installierte Pakete/Updates anzeigen, `composer.phar`
   herunterladen/aktualisieren, Selfupdate, Update (Profil/Dry-Run/normal),
-  Sicherheitsprüfung (`composer audit`)
+  Sicherheitsprüfung (`composer audit`), Install aus `composer.lock`
+  (Umzug), Update ohne Sicherheitssperre (für Contao 4.13)
 - **Cache** - Cache leeren (aktuelle Umgebung, oder prod + dev)
 - **Datenbank + Migration** - `contao:migrate`, Backup erstellen/auflisten/
   wiederherstellen, Migrate-Debugging
