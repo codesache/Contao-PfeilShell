@@ -115,7 +115,7 @@ FRESH_INSTALL_VERSIONS=(
 # jeder Änderung an contao.sh/_contao-lib.sh die PATCH-Stelle hochzählen
 # (1.1.0 -> 1.1.1 -> 1.1.2 ...), bei größeren Feature-Sprüngen die
 # MINOR-Stelle.
-CONTAO_SH_VERSION="1.10.1"
+CONTAO_SH_VERSION="1.10.4"
 TOOL_TITLE="Contao PfeilShell - V${CONTAO_SH_VERSION}"
 
 set -u
@@ -710,36 +710,29 @@ contao_offer_migrate() {
     esac
 }
 
-# Wie contao_run, aber für composer update/require: die Ausgabe wird
-# mitgeschnitten, damit bei einem Fehlschlag wegen gesperrter Pakete mit
-# bekannten Sicherheitslücken ("affected by security advisories", typisch bei
-# Contao 4.13 mit neuem Composer) ein konkreter Lösungshinweis erscheint.
+# Wie contao_run, aber für composer update/require: Der Befehl läuft direkt im
+# Terminal (damit Composer und die von ihm gestarteten Contao-Console-Befehle
+# ihre Farben und Rückfragen behalten - ein Mitschnitt per Pipe würde beides
+# abschalten). Nur wenn er fehlschlägt, wird er zur Diagnose einmal als
+# Dry-Run wiederholt: meldet Composer dort "affected by security advisories"
+# (gesperrte Pakete mit bekannten Sicherheitslücken, typisch bei Contao 4.13
+# mit neuem Composer), erscheint ein konkreter Lösungshinweis.
 contao_run_composer() {
-    local desc="$1" out rc=0
+    local desc="$1" rc=0 diag
     shift
-    out="$(mktemp)"
+    contao_run "$desc" "$@" || rc=$?
+    [ "$rc" -eq 0 ] && return 0
+
     echo ""
-    echo "${C_GREY}-> Ausführen: $*${C_RESET}"
-    echo ""
-    "$@" 2>&1 | tee "$out"
-    rc="${PIPESTATUS[0]}"
-    if [ "$rc" -eq 0 ]; then
-        contao_log "OK: $desc"
-        echo "${C_GREEN}OK: $desc${C_RESET}"
-        rm -f "$out"
-        return 0
-    fi
-    contao_log "FEHLER (Exit $rc): $desc"
-    echo ""
-    echo "${C_RED}!! Befehl ist mit Exit-Code $rc fehlgeschlagen: $desc${C_RESET}" >&2
-    if grep -q 'affected by security advisories' "$out" 2>/dev/null; then
+    echo "${C_GREY}Prüfe Fehlerursache (Dry-Run) ...${C_RESET}"
+    diag="$("$@" --dry-run --no-ansi </dev/null 2>&1)" || true
+    if printf '%s\n' "$diag" | grep -q 'affected by security advisories'; then
         echo ""
         echo "${C_ORANGE}HINWEIS: Composer sperrt Pakete mit bekannten Sicherheitslücken (typisch bei Contao 4.13).${C_RESET}"
         echo "${C_ORANGE} - Umzug/frisches Verzeichnis mit vorhandener composer.lock: Menüpunkt \"Composer Install (aus composer.lock)\".${C_RESET}"
         echo "${C_ORANGE} - Sonst: Menüpunkt \"Composer Update ohne Sicherheitssperre\" (--no-security-blocking).${C_RESET}"
         echo "${C_ORANGE}Die Lücken bleiben dabei bestehen - langfristig auf Contao 5 upgraden.${C_RESET}"
     fi
-    rm -f "$out"
     return "$rc"
 }
 
